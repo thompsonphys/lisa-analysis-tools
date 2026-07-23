@@ -29,7 +29,30 @@ from typing import Optional
 
 import numpy as np
 
-from few.utils.utility import get_polarization_angle, get_viewing_angles
+# FEW 2.0 removed the module-level ``get_viewing_angles`` /
+# ``get_polarization_angle`` helpers (they became private methods on the
+# waveform classes). Reimplement them here from FEW 2.0's own frame math
+# (few.waveform.waveform._get_viewing_angles / _to_SSB_frame) so this module
+# keeps working against FEW >= 2.0.
+def get_viewing_angles(qS, phiS, qK, phiK):
+    """Source-frame viewing angles ``(theta, phi)`` from detector-frame sky
+    location ``(qS, phiS)`` and spin direction ``(qK, phiK)``."""
+    R = np.array([np.sin(qS) * np.cos(phiS), np.sin(qS) * np.sin(phiS), np.cos(qS)])
+    S = np.array([np.sin(qK) * np.cos(phiK), np.sin(qK) * np.sin(phiK), np.cos(qK)])
+    phi = -np.pi / 2.0  # by definition of the source frame
+    theta = np.arccos(-np.dot(R, S))
+    return theta, phi
+
+
+def get_polarization_angle(qS, phiS, qK, phiK):
+    """LDC polarization angle ``psi`` from detector-frame sky location and
+    spin direction."""
+    up_ldc = np.cos(qS) * np.sin(qK) * np.cos(phiS - phiK) - np.cos(qK) * np.sin(qS)
+    dw_ldc = np.sin(qK) * np.sin(phiS - phiK)
+    if dw_ldc != 0.0:
+        return -np.arctan2(up_ldc, dw_ldc)
+    return 0.5 * np.pi
+
 
 from lisatools.response.tdionfly import TDTDIonTheFly
 
