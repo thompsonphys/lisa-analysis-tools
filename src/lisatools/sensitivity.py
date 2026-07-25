@@ -477,8 +477,7 @@ class X2TDISens(Sensitivity):
             + Sensitivity.stochastic_transform.__doc__.split("PSDs.\n\n")[-1]
         )
         x = 2.0 * np.pi * lisaLT * f
-        # TODO: check these functions for TDI2
-        t = 4.0 * x**2 * np.sin(x) ** 2
+        t = 4.0 * x**2 * np.sin(x) ** 2 * (4.0 * np.sin(2.0 * x) ** 2)
         return Sh * t
 
 
@@ -586,8 +585,9 @@ class XY2TDISens(Sensitivity):
         """
         Transform stochastic background to TDI2 XY CSD.
 
-        Note: For now, using same transform as TDI1 (placeholder).
-        TODO: Verify correct stochastic transform for TDI2 CSDs.
+        The TDI-1.5 X transform scaled by the TDI-2 filter
+        :math:`4\\sin^2(2x)` and by :math:`-1/2`, the low-frequency
+        XY/XX ratio for an isotropic background.
 
         Args:
             f: Frequency array [Hz].
@@ -598,8 +598,7 @@ class XY2TDISens(Sensitivity):
             Stochastic contribution to CSD.
         """
         x = 2.0 * np.pi * lisaLT * f
-        # Placeholder - using TDI1 form scaled by -0.5
-        t = -0.5 * (4.0 * x**2 * np.sin(x) ** 2)
+        t = -0.5 * (4.0 * x**2 * np.sin(x) ** 2) * (4.0 * np.sin(2.0 * x) ** 2)
         return Sh * t
 
 
@@ -846,9 +845,8 @@ class A2TDISens(X2TDISens, Sensitivity):
             + Sensitivity.stochastic_transform.__doc__.split("PSDs.\n\n")[-1]
         )
         x = 2.0 * np.pi * lisaLT * f
-        # TODO: check these functions for TDI2
-        t = 4.0 * x**2 * np.sin(x) ** 2
-        return Sh * t
+        t = 4.0 * x**2 * np.sin(x) ** 2 * (4.0 * np.sin(2.0 * x) ** 2)
+        return 1.5 * (Sh * t)
 
 
 class E2TDISens(A2TDISens):
@@ -911,9 +909,8 @@ class T2TDISens(X2TDISens, Sensitivity):
             + Sensitivity.stochastic_transform.__doc__.split("PSDs.\n\n")[-1]
         )
         x = 2.0 * np.pi * lisaLT * f
-        # TODO: check these functions for TDI2
-        t = 4.0 * x**2 * np.sin(x) ** 2
-        return Sh * t
+        t = 4.0 * x**2 * np.sin(x) ** 2 * (4.0 * np.sin(2.0 * x) ** 2)
+        return 0.0 * (Sh * t)
 
 
 class LISASens(Sensitivity):
