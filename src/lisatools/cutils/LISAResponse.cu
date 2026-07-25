@@ -135,13 +135,14 @@ void interp_single(double *result, double *input, int h, int d, double e, double
 
         double F = j + e;
         double G = j + (1 - e);
+        double rFG = 1.0 / (F * G);
 
         // printf("mid: %d %d %d\n", j, d, start_input_ind);
 
         // perform calculation
         temp_up = input[d + 1 + j - start_input_ind];
         temp_down = input[d - j - start_input_ind];
-        sum += E * (temp_up / F + temp_down / G);
+        sum += E * (temp_up * G + temp_down * F) * rFG;
     }
     temp_up = input[d + 1 - start_input_ind];
     temp_down = input[d - start_input_ind];
@@ -192,14 +193,15 @@ void interp(double *result_hp, double *result_hc, cmplx *input, int h, int d, do
 
         double F = j + e;
         double G = j + (1 - e);
+        double rFG = 1.0 / (F * G);
 
         // perform calculation
         temp_up = input[d + 1 + j - start_input_ind];
         temp_down = input[d - j - start_input_ind];
 
         // if ((i == 100) && (link_i == 0)) printf("mid: %d %d %d %e %e %e %e %e %e %e\n", j, d + 1 + j - start_input_ind, d - j - start_input_ind, temp_up, temp_down, E, F, G);
-        sum_hp += E * (temp_up.real() / F + temp_down.real() / G);
-        sum_hc += E * (temp_up.imag() / F + temp_down.imag() / G);
+        sum_hp += E * (temp_up.real() * G + temp_down.real() * F) * rFG;
+        sum_hc += E * (temp_up.imag() * G + temp_down.imag() * F) * rFG;
     }
     temp_up = input[d + 1 - start_input_ind];
     temp_down = input[d - start_input_ind];
