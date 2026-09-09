@@ -3,8 +3,14 @@ requires = [
   "Cython",
   "numpy",
   "scikit_build_core",
-  "pybind11",
+# nanobind is pinned EXACTLY (sprint-wide invariant, see LAT
+# constraints/sprint.txt): cross-wheel nanobind type sharing (OrbitsWrap,
+# CubicSplineWrap, ...) requires every separately-built wheel to embed the
+# same nanobind internals ABI. Bump in ONE sprint-wide PR only.
+  "nanobind==2.12.0",
   "gpubackendtools @ git+https://github.com/thompsonphys/GPUBackendTools.git@spline"
+  "h5py",
+  "setuptools_scm"
 ]
 build-backend = "scikit_build_core.build"
 
@@ -18,16 +24,15 @@ authors = [
 ]
 readme = "README.md"
 
-requires-python = ">= 3.10"
+requires-python = ">= 3.12"
 
 dependencies = [
-  "exceptiongroup; python_version<'3.11'", # To access ExceptionGroup with Python 3.9 and 3.10
   "h5py",
   "matplotlib",
   "jsonschema",                            # To validate content of file registry
-  "lisaconstants",
+  "lisaconstants==2.0.2",
   "multispline",
-  "numba",
+  "numba>=0.63.1",
   "numpy",
   "nvidia-ml-py",                          # To detect CUDA version if any
   "platformdirs",                          # To locate config and data dir on all platforms
@@ -38,8 +43,21 @@ dependencies = [
   "scipy",
   "tqdm",
   "wrapt",
+  # NOTE (2026-06-10): the CUDA backends now import gbt_backend_<flavor>.interp
+  # at load time (GBT is the single registrant for CubicSplineWrap). Once
+  # GPUBackendTools publishes cuda plugin wheels, add a #@DEPS_GBTCUDA@
+  # placeholder here + a sed step in publish.yml mirroring #@DEPS_CUPYCUDA@.
   #@DEPS_CUPYCUDA@,
   #@DEPS_LISATOOLSCORE@,
+  "mojito",
+  "mojito-processor",
+  "astropy",
+  "scikit-learn",
+  "cudakima",
+  # "install>=0.0.1",
+  # NOTE (2026-06-11, stft_tof merge): stft_tof added "pybind11>=3.0.4"
+  # here; dropped -- the binding layer is nanobind since Phase 3M and the
+  # absorbed C++ is ported accordingly.
 ]
 
 
@@ -76,22 +94,63 @@ optional-dependencies.sampling = [
   "fastlisaresponse",
   "corner",
   "chainconsumer",
+  "mpi4py",
 ]
 
 optional-dependencies.testing = [
   "matplotlib",
   "eryn",
+  "gbgpu",
   "corner",
   "gpubackendtools>=0.0.16",
 ]
+
+optional-dependencies.dev = [
+  "black",
+  "isort",
+  "mypy",
+  "pre-commit",
+  "pylint",
+]
+
+# Phase 4 (2026-06-02): FEW-pattern adoption -- CLI entry point for the
+# citation registry. `lisatools_citations` -> lisatools.cmd.citations:main.
+# See `lisatools/utils/citations.py` and CITATION.cff at repo root.
+scripts.lisatools_citations = "lisatools.cmd.citations:main"
 
 [tool.setuptools_scm]
 version_scheme = "no-guess-dev"
 local_scheme = "node-and-date"
 version_file = "src/lisatools/_version.py"
 
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+
+[[tool.uv.index]]
+name = "gitlab-esa-commons"
+url = "https://gitlab.esa.int/api/v4/groups/29349/-/packages/pypi/simple"
+
+[[tool.uv.index]]
+name = "testpypi"
+url = "https://test.pypi.org/simple/"
+
 [tool.scikit-build]
 wheel.packages = ["src/lisatools"]
+
+wheel.exclude = [
+  # "**.pyx",
+  # "**.cu",
+  # "**.cxx",
+  # "**.hh",
+  #"**.h",
+  # "**.hpp",
+  "**/CMakeLists.txt",
+  "lib/pkgconfig",
+  "lib/cmake",
+  "lib/*.so",
+  "lib/*.a",
+]
 metadata.version.provider = "scikit_build_core.metadata.setuptools_scm"
 sdist.include = [
   "src/lisatools/_version.py",
@@ -109,8 +168,42 @@ sdist.include = [
   # "src/lisatools/cutils/pycppdetector.pxd",
   "src/lisatools/cutils/Detector.hpp",
   "src/lisatools/cutils/global.hpp",
-  "src/lisatools/cutils/binding.cxx",
-  "src/lisatools/cutils/binding.hpp",
+  "src/lisatools/cutils/binding_detector.cxx",
+  "src/lisatools/cutils/binding_detector.hpp",
+  "src/lisatools/cutils/lisatools_header_abi.hpp",
+  "src/lisatools/cutils/orbits_view.hpp",
+  "src/lisatools/cutils/LISAanalysisToolsConfig.cmake",
+  # Phase 3E: LISA-response sources absorbed from lisa-on-gpu.
+  "src/lisatools/cutils/LISAResponse.cu",
+  "src/lisatools/cutils/LISAResponse.hh",
+  "src/lisatools/cutils/binding_flr.cxx",
+  "src/lisatools/cutils/binding_flr.hpp",
+  # Phase 3L: TDIonTheFly C++ carve-out, class by class.
+  # (2026-06 domains consolidation: fd_domain.hh / wdm_settings.hh /
+  # wdm_domain.hh are now deprecated #include shims onto domains.hpp.)
+  "src/lisatools/cutils/fd_domain.hh",
+  "src/lisatools/cutils/binding_fd_domain.hpp",
+  "src/lisatools/cutils/wdm_settings.hh",
+  "src/lisatools/cutils/binding_wdm_settings.hpp",
+  "src/lisatools/cutils/wdm_domain.hh",
+  "src/lisatools/cutils/binding_wdm_domain.hpp",
+  # stft_tof merge + 2026-06 domains consolidation: STFT/FD domain machinery
+  # and the galactic-response backend.
+  "src/lisatools/cutils/domains.hpp",
+  "src/lisatools/cutils/domains.cu",
+  "src/lisatools/cutils/binding_domains.hpp",
+  "src/lisatools/cutils/galactic_response.hpp",
+  "src/lisatools/cutils/galactic_response.cu",
+  "src/lisatools/cutils/lat_tdi_on_the_fly.hh",
+  "src/lisatools/cutils/lat_tdi_on_the_fly.cu",
+  "src/lisatools/cutils/lat_spline_tdi_waveform.hh",
+  "src/lisatools/cutils/lat_spline_tdi_waveform.cu",
+  "src/lisatools/cutils/binding_lat_spline_tdi.hpp",
+  # Phase 4: citation registry data file (parsed by lisatools.utils.citations).
+  "CITATION.cff",
+  # stft_tof merge: CMake sources template consumed by cutils/CMakeLists.
+  "src/lisatools/cutils/lisatools_sources.cmake",
+  "src/lisatools/cutils/lisatools_sources.cmake.in",
 ]
 sdist.exclude = [
   ".devcontainer/",
@@ -125,19 +218,13 @@ sdist.exclude = [
   "tests/base.py",
 ]
 
-wheel.exclude = [
-  # "**.pyx",
-  # "**.cu",
-  # "**.cxx",
-  # "**.hh",
-  #"**.h",
-  # "**.hpp",
-  "**/CMakeLists.txt",
-  "lib/pkgconfig",
-  "lib/cmake",
-  "lib/*.so",
-  "lib/*.a",
-]
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
 
 [tool.pyproject-fmt]
 max_supported_python = "3.13"
@@ -154,3 +241,13 @@ report.omit = [
   "*/lisatools/git_version.py",
   "*/lisatools_backend_*/git_version.py",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
+
+[tool.uv.sources]
+mojito = { index = "pypi" }
+lisaconstants = { index = "pypi" }
+mojito-processor = { index = "testpypi" }  # TODO: switch to pypi once published there

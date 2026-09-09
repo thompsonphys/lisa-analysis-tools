@@ -1,15 +1,27 @@
-from __future__ import annotations
-from lisatools.detector import EqualArmlengthOrbits
-import numpy as np
-from typing import Optional, Any
-from copy import deepcopy
+"""EMRI waveform classes wrapping ``few``'s :class:`GenerateEMRIWaveform` with the LISA TDI response."""
 
-from few.waveform import GenerateEMRIWaveform
+from __future__ import annotations
+
+from copy import deepcopy
+from typing import Any, Optional
+
+import numpy as np
+from lisatools.response.directresponse import ResponseWrapper
+from few.waveform.waveform import GenerateEMRIWaveform
+
+from ...detector import EqualArmlengthOrbits
 
 # imports
 from ..waveformbase import AETTDIWaveform
-from fastlisaresponse import ResponseWrapper
-from ...detector import EqualArmlengthOrbits
+
+# try:
+#     import cupy as cp
+# except ImportError:
+#     pass
+
+
+# _ = few.get_backend('cuda12x')
+
 
 default_response_kwargs = dict(
     t0=30000.0,
@@ -40,14 +52,13 @@ class EMRITDIWaveform(AETTDIWaveform):
         emri_waveform_kwargs: Optional[dict] = {},
         response_kwargs: Optional[dict] = default_response_kwargs,
     ):
+
         # sky parameters in GenerateEMRIWaveform
         index_lambda = 8
         index_beta = 7
 
         for key in default_response_kwargs:
-            response_kwargs[key] = response_kwargs.get(
-                key, default_response_kwargs[key]
-            )
+            response_kwargs[key] = response_kwargs.get(key, default_response_kwargs[key])
         gen_wave = GenerateEMRIWaveform(
             *emri_waveform_args,
             sum_kwargs=dict(pad_output=True),
@@ -65,15 +76,27 @@ class EMRITDIWaveform(AETTDIWaveform):
             flip_hx=True,  # set to True if waveform is h+ - ihx
             remove_sky_coords=False,
             is_ecliptic_latitude=False,
-            remove_garbage=True,  # removes the beginning of the signal that has bad information
             **response_kwargs_in,
         )
 
     @property
     def dt(self) -> float:
-        """timestep"""
+        """Timestep in seconds."""
         return self.response.dt
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Generate the EMRI TDI waveform by delegating to the wrapped response.
+
+        Args:
+            *args: Positional arguments forwarded to :meth:`ResponseWrapper.__call__`.
+            **kwargs: Keyword arguments forwarded to :meth:`ResponseWrapper.__call__`.
+
+        Returns:
+            The output of the underlying :class:`ResponseWrapper` call (TDI channels).
+        """
         __doc__ = ResponseWrapper.__call__.__doc__
-        return self.response(*args, **kwargs)
+        try:
+            return self.response(*args, **kwargs)
+        except Exception as e:
+            print(e)
+            breakpoint()

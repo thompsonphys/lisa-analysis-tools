@@ -7,6 +7,7 @@
 
    user/sensitivity
    user/detector
+   user/response
    user/stochastic
    user/datacontainer
    user/diagnostic
@@ -15,6 +16,8 @@
    
 .. toctree::
    :maxdepth: 4
-   :caption: Tutorial:
+   :caption: Tutorials:
 
    lisatools_tutorial
+   lisa_response_tutorial
+   wdm_transform_tutorial

@@ -14,7 +14,12 @@ project(lisaanalysistools VERSION ${SKBUILD_PROJECT_VERSION} LANGUAGES CXX) #@AD
 
 # ---- Find required dependencies ----
 find_package(Python COMPONENTS Interpreter Development.Module NumPy REQUIRED)
-find_package(pybind11 CONFIG)
+# Phase 3M (2026-06-04): sprint-wide pybind11 -> nanobind migration.
+execute_process(
+  COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
+  OUTPUT_VARIABLE nanobind_DIR
+  OUTPUT_STRIP_TRAILING_WHITESPACE)
+find_package(nanobind CONFIG REQUIRED)
 
 set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -46,6 +51,17 @@ set_property(
   CACHE LISATOOLS_WITH_GPU PROPERTY
   STRINGS "AUTO" "ON" "OFF" "ONLY" "BARE"
 )
+
+# LISATOOLS_CUDA_ARCH will be passed as the CUDA_ARCHITECTURES property for the CUDA
+# backend if it is compiled. See the documentation of CUDA_ARCHITECTURES:
+# https://cmake.org/cmake/help/latest/prop_tgt/CUDA_ARCHITECTURES.html
+# setting the cuda_arch for specific devices 
+# set(
+#   LISATOOLS_CUDA_ARCH "70;75;80;86;90"
+#   CACHE STRING "CUDA Architecture targetted for LISATOOLS compilation (see doc of \
+#           CMAKE_CUDA_ARCHITECTURES)."
+# )
+# see fix below
 
 set(
   LISATOOLS_MARCH "native"
@@ -117,10 +133,9 @@ if(_LISATOOLS_WITH_GPU)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
 
-  # LISATOOLS_CUDA_ARCH will be passed as the CUDA_ARCHITECTURES property for the CUDA
-  # backend if it is compiled. See the documentation of CUDA_ARCHITECTURES:
-  # https://cmake.org/cmake/help/latest/prop_tgt/CUDA_ARCHITECTURES.html
-  # For cuda13x and upwards cuda_arch <= 70 (v100) is not supported anymore.
+  # For cuda13x and upwards cuda_arch <= 70 (v100) is not supported anymore. The code below takes 
+  # that into consideration, while still being agnostic to the cuda version usage. The following 
+  # checks if CUDAToolkit_VERSION is less than 13.0 --> full default arch. Otherwise, without 70.
   set(DEFAULT_ARCHS "70;75;80;86;90")
   set(FILTERED_ARCHS "")
 

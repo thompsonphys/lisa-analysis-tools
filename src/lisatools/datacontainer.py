@@ -1,12 +1,15 @@
+"""Container for LISA data, residuals, or templates and their basis settings."""
+
 from __future__ import annotations
-import warnings
-from abc import ABC
-from typing import Any, Tuple, Optional, List
 
 import math
-import numpy as np
-from scipy import interpolate
+import warnings
+from abc import ABC
+from typing import Any, List, Optional, Tuple
+
 import matplotlib.pyplot as plt
+import numpy as np
+from scipy import interpolate, signal
 
 try:
     import cupy as cp
@@ -14,57 +17,116 @@ try:
 except (ModuleNotFoundError, ImportError):
     import numpy as cp
 
+import dataclasses
+
 from . import detector as lisa_models
-from .utils.utility import AET, get_array_module
-from .utils.constants import *
-from .stochastic import (
-    StochasticContribution,
-    FittedHyperbolicTangentGalacticForeground,
-)
+from . import domains
 from .sensitivity import SensitivityMatrix
+from .stochastic import FittedHyperbolicTangentGalacticForeground, StochasticContribution
+from .utils.constants import *
+from .utils.utility import AET, asnumpy, get_array_module
 
 
+# TODO/DOCS: this stub appears to be a forward declaration for the type hint on __init__'s data_res_in parameter; verify whether it's still needed.
 class DataResidualArray:
     pass
 
 
 class DataResidualArray:
-    """Container to hold Data, residual, or template information.
+    """Deprecated container — kept as a thin shim around :class:`~lisatools.domains.DomainBase`.
 
-    This class abstracts the connection with the sensitivity matrices to make this analysis
-    as generic as possible for the user frontend, while handling
-    special computations in the backend.
+    All capabilities (slicing, add/subtract signals, ``f_arr``/``start_freq_ind``/
+    ``layer_df`` accessors, ``char_strain``, ``loglog``, etc.) have moved onto
+    :class:`~lisatools.domains.DomainBase` and its concrete subclasses
+    (:class:`~lisatools.domains.FDSignal`, :class:`~lisatools.domains.WDMSignal`,
+    :class:`~lisatools.domains.TDSignal`, :class:`~lisatools.domains.STFTSignal`).
+    Pass those directly to :class:`~lisatools.analysiscontainer.AnalysisContainer`.
+
+    This class is retained as a transparent wrapper so existing code keeps
+    working; a :class:`DeprecationWarning` is emitted at construction to flag
+    call sites that should migrate. The constructor still accepts a raw NumPy /
+    CuPy / JAX array (plus ``input_signal_domain``), an existing
+    :class:`~lisatools.domains.DomainBase`, or another :class:`DataResidualArray`.
 
     Args:
-        data_res_in: Data, residual, or template input information. Can be a list, numpy array
-            or another :class:`DataResidualArray`.
-        dt: Timestep in seconds.
-        f_arr: Frequency array.
-        df: Delta f in frequency domain.
+        data_res_in: Data, residual, or template input.
+        signal_domain: Target domain (defaults to ``input_signal_domain``).
+        input_signal_domain: Domain of the raw input array (required for raw arrays).
+        window: Optional window applied during a domain transform.
         **kwargs: For future compatibility.
-
     """
 
     def __init__(
         self,
         data_res_in: List[np.ndarray] | np.ndarray | DataResidualArray,
-        dt: Optional[float] = None,
-        f_arr: Optional[np.ndarray] = None,
-        df: Optional[float] = None,
+        signal_domain: Optional[domains.DomainSettingsBase] = None,
+        input_signal_domain: Optional[domains.DomainSettingsBase] = None,
+        window: np.ndarray | cp.ndarray | None = None,
         **kwargs: dict,
     ) -> None:
+        warnings.warn(
+            "DataResidualArray is deprecated. Pass a DomainBase child "
+            "(FDSignal / WDMSignal / TDSignal / STFTSignal) directly to "
+            "AnalysisContainer and downstream APIs instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.data_res_in_orig_input = data_res_in
         if isinstance(data_res_in, DataResidualArray):
             for key, item in data_res_in.__dict__.items():
                 setattr(self, key, item)
 
         else:
-            self._check_inputs(dt=dt, f_arr=f_arr, df=df)
-            self.data_res_arr = data_res_in
-            self._store_time_and_frequency_information(dt=dt, f_arr=f_arr, df=df)
+            if not isinstance(data_res_in, domains.DomainBase):
+                # Accept numpy, cupy, or jax arrays (the array-module
+                # dispatch via ``get_array_module`` handles all three).
+                try:
+                    xp = get_array_module(data_res_in)
+                except ValueError as e:
+                    raise AssertionError(
+                        "data_res_in must be a numpy / cupy / jax array, "
+                        "DomainBase, or DataResidualArray."
+                    ) from e
+                data_res_in = xp.atleast_2d(data_res_in)
+                if input_signal_domain is None:
+                    raise ValueError(
+                        "If inputing a basic array, must put in the input_signal_domain argument."
+                    )
+                assert isinstance(input_signal_domain, domains.DomainSettingsBase)
+                data_res_in = input_signal_domain.associated_class(data_res_in, input_signal_domain)
+
+            input_signal_domain = data_res_in.settings
+
+            if signal_domain is None:
+                if isinstance(input_signal_domain, domains.TDSettings):
+                    # default for TD for now is in FD
+                    Nf = np.fft.rfft(np.ones(input_signal_domain.N)).shape[0]
+                    df = 1. / (input_signal_domain.N * input_signal_domain.dt)
+                    signal_domain = domains.FDSettings(Nf, df, force_backend=input_signal_domain.force_backend)
+
+                else:
+                    # default is same domain
+                    signal_domain = input_signal_domain
+             
+            if signal_domain == input_signal_domain:
+                self.data_res_arr = data_res_in
+            else:
+                self.data_res_arr = data_res_in.transform(signal_domain, window=window)
+
+            self.nchannels = self.data_res_arr.nchannels
+            self.nbatch = self.data_res_arr.nbatch
+            self.is_batched = self.data_res_arr.is_batched
+            self.data_shape = self.data_res_arr.settings.basis_shape
+
+        self.init_kwargs = dict(
+            signal_domain=signal_domain,
+            input_signal_domain=input_signal_domain,
+            **kwargs,
+        )
 
     @property
     def init_kwargs(self) -> dict:
-        """Initial dt, df, f_arr"""
+        """Initial keyword arguments passed at construction (``signal_domain``, ``input_signal_domain``, ...)."""
         return self._init_kwargs
 
     @init_kwargs.setter
@@ -72,26 +134,68 @@ class DataResidualArray:
         """Set initial kwargs."""
         self._init_kwargs = init_kwargs
 
-    def _check_inputs(
-        self,
-        dt: Optional[float] = None,
-        f_arr: Optional[np.ndarray] = None,
-        df: Optional[float] = None,
-    ):
-        number_of_none = 0
+    # def _check_inputs(
+    #     self,
+    #     dt: Optional[float] = None,
+    #     f_arr: Optional[np.ndarray] = None,
+    #     df: Optional[float] = None,
+    # ):
+    #     number_of_none = 0
 
-        number_of_none += 1 if dt is None else 0
-        number_of_none += 1 if f_arr is None else 0
-        number_of_none += 1 if df is None else 0
+    #     number_of_none += 1 if dt is None else 0
+    #     number_of_none += 1 if f_arr is None else 0
+    #     number_of_none += 1 if df is None else 0
 
-        if number_of_none == 3:
-            raise ValueError("Must provide either df, dt, or f_arr.")
+    #     if number_of_none == 3:
+    #         raise ValueError("Must provide either df, dt, or f_arr.")
 
-        elif number_of_none == 1:
-            raise ValueError(
-                "Can only provide one of dt, f_arr, or df. Not more than one."
-            )
-        self.init_kwargs = dict(dt=dt, f_arr=f_arr, df=df)
+    #     elif number_of_none == 1:
+    #         raise ValueError(
+    #             "Can only provide one of dt, f_arr, or df. Not more than one."
+    #         )
+    #     self.init_kwargs = dict(dt=dt, f_arr=f_arr, df=df)
+    
+    @property
+    def start_freq_ind(self):
+        """Index of the first frequency bin relative to a uniform ``df`` grid (or ``None``).
+
+        For WDM data this is the first active *frequency-layer* index
+        (``settings.ind_min_f``); for FD data it is the first bin index
+        ``f_arr[0] / df``. Returns ``None`` when no uniform grid exists.
+        """
+        if isinstance(self.settings, domains.WDMSettings):
+            return int(self.settings.ind_min_f)
+        if self._df is not None:
+            return int(self._f_arr[0] / self._df)
+        return None
+
+    @property
+    def start_freq_layer_ind(self):
+        """First active WDM frequency-layer index (``ind_min_f``); ``None`` if not WDM."""
+        if isinstance(self.settings, domains.WDMSettings):
+            return int(self.settings.ind_min_f)
+        return None
+
+    @property
+    def start_time_layer_ind(self):
+        """First active WDM time-layer index (``ind_min_t``); ``None`` if not WDM."""
+        if isinstance(self.settings, domains.WDMSettings):
+            return int(self.settings.ind_min_t)
+        return None
+
+    @property
+    def layer_df(self):
+        """WDM layer frequency spacing; ``None`` if not WDM."""
+        if isinstance(self.settings, domains.WDMSettings):
+            return float(self.settings.layer_df)
+        return None
+
+    @property
+    def layer_dt(self):
+        """WDM layer time spacing; ``None`` if not WDM."""
+        if isinstance(self.settings, domains.WDMSettings):
+            return float(self.settings.layer_dt)
+        return None
 
     def _store_time_and_frequency_information(
         self,
@@ -99,6 +203,7 @@ class DataResidualArray:
         f_arr: Optional[np.ndarray] = None,
         df: Optional[float] = None,
     ):
+        """Populate ``_dt``, ``_df``, ``_Tobs``, ``_fmax``, and ``_f_arr`` from one of ``dt``/``f_arr``/``df``."""
         if dt is not None:
             self._dt = dt
             self._Tobs = self.data_length * dt
@@ -113,19 +218,18 @@ class DataResidualArray:
             self._data_res_arr = tmp
             self.data_length = self._data_res_arr.shape[-1]
 
-        elif df is not None:
-            self._df = df
-            self._Tobs = 1 / self._df
-            self._fmax = (self.data_length - 1) * df
-            self._dt = 1 / (2 * self._fmax)
-            self._f_arr = np.arange(0.0, self._fmax, self._df)
-
+        # THIS NEEDS TO BE BEFORE df CHECK
         elif f_arr is not None:
             self._f_arr = f_arr
             self._fmax = f_arr.max()
             # constant spacing
-            if np.all(np.diff(f_arr) == np.diff(f_arr)[0]):
-                self._df = np.diff(f_arr)[0].item()
+            if np.allclose(np.diff(f_arr), np.diff(f_arr)[0]):
+                if df is None:
+                    raise ValueError(
+                        "When providing evenly spaced f_arr, need to also provide df to avoid numerical issues."
+                    )
+                # TODO: fix this up in the docs
+                self._df = df  # np.diff(f_arr)[0].item()
 
                 if f_arr[0] == 0.0:
                     # could be fft because of constant spacing and f_arr[0] == 0.0
@@ -142,10 +246,22 @@ class DataResidualArray:
                 self._Tobs = None
                 self._dt = None
 
+        elif df is not None:
+            self._df = df
+            self._Tobs = 1 / self._df
+            self._fmax = (self.data_length - 1) * df
+            self._dt = 1 / (2 * self._fmax)
+            self._f_arr = np.arange(0.0, self._fmax, self._df)
+
         if len(self.f_arr) != self.data_length:
             raise ValueError(
                 "Entered or determined f_arr does not have the same length as the data channel inputs."
             )
+
+    @property
+    def settings(self) -> domains.DomainSettingsBase:
+        """Basis settings of the data residual array."""
+        return self.data_res_arr.settings
 
     @property
     def fmax(self):
@@ -154,7 +270,14 @@ class DataResidualArray:
 
     @property
     def f_arr(self):
-        """Frequency array."""
+        """Frequency array.
+
+        For WDM data this is the active per-layer frequency grid
+        (``settings.f_arr``); for FD data it is the precomputed FD grid
+        stored at construction.
+        """
+        if isinstance(self.settings, domains.WDMSettings):
+            return self.settings.f_arr
         return self._f_arr
 
     @property
@@ -175,56 +298,32 @@ class DataResidualArray:
 
     @property
     def df(self):
-        """Delta f in the frequency domain."""
+        """Delta f.
+
+        For WDM data this is the layer frequency spacing
+        (``settings.layer_df``); for FD data it is the precomputed FD
+        bin spacing.
+        """
+        if isinstance(self.settings, domains.WDMSettings):
+            return float(self.settings.layer_df)
         if self._df is None:
             raise ValueError("df cannot be determined from this f_arr input.")
-
         return self._df
 
     @property
     def frequency_arr(self) -> np.ndarray:
         """Frequency array"""
-        return self._f_arr
+        return self.settings.f_arr
 
     @property
-    def data_res_arr(self) -> np.ndarray:
+    def data_res_arr(self) -> DomainBase:
         """Actual data residual array"""
         return self._data_res_arr
 
     @data_res_arr.setter
     def data_res_arr(self, data_res_arr: List[np.ndarray] | np.ndarray) -> None:
         """Set ``data_res_arr``."""
-        self._data_res_arr_input = data_res_arr
-
-        if (
-            isinstance(data_res_arr, np.ndarray) or isinstance(data_res_arr, cp.ndarray)
-        ) and data_res_arr.ndim == 1:
-            data_res_arr = [data_res_arr]
-
-        elif (
-            isinstance(data_res_arr, np.ndarray) or isinstance(data_res_arr, cp.ndarray)
-        ) and data_res_arr.ndim == 2:
-            data_res_arr = list(data_res_arr)
-
-        new_out = np.full(len(data_res_arr), None, dtype=object)
-        self.data_length = None
-        for i in range(len(data_res_arr)):
-            current_data = data_res_arr[i]
-            if isinstance(current_data, np.ndarray) or isinstance(
-                current_data, cp.ndarray
-            ):
-                if self.data_length is None:
-                    self.data_length = len(current_data)
-                else:
-                    assert len(current_data) == self.data_length
-
-                new_out[i] = current_data
-            else:
-                raise ValueError
-
-        self.nchannels = len(new_out)
-        xp = get_array_module(new_out[0])
-        self._data_res_arr = xp.asarray(list(new_out), dtype=new_out[0].dtype)
+        self._data_res_arr = data_res_arr
 
     def __getitem__(self, index: tuple) -> np.ndarray:
         """Index this class directly in ``self.data_res_arr``."""
@@ -241,7 +340,7 @@ class DataResidualArray:
 
     def flatten(self) -> np.ndarray:
         """Flatten the ``data_res_arr``."""
-        return self.data_res_arr.flatten()
+        return self.data_res_arr[:].flatten()
 
     @property
     def shape(self) -> tuple:
@@ -271,6 +370,8 @@ class DataResidualArray:
 
 
         """
+
+        assert isinstance(self.data_res_arr.data_res_arr.settings, domains.FDSettings)
         if ax is None and fig is None:
             nrows = 1
             ncols = self.shape[0]
@@ -289,20 +390,21 @@ class DataResidualArray:
                     inds_list = inds
 
             elif isinstance(ax, plt.Axes):
-                assert inds is not None and (
-                    isinstance(inds, tuple) or isinstance(inds, int)
-                )
+                assert inds is not None and (isinstance(inds, tuple) or isinstance(inds, int))
                 ax = [ax]
                 inds_list = [inds]
 
         elif fig is not None:
             raise NotImplementedError
 
+        _f_arr = asnumpy(self.settings.f_arr)
+        _data_res_arr = asnumpy(self.data_res_arr.arr)
+
         for i, ax_tmp in zip(inds_list, ax):
-            plot_in = np.abs(self.data_res_arr[i])
+            plot_in = np.abs(_data_res_arr[i])
             if char_strain:
-                plot_in *= self.frequency_arr
-            ax_tmp.loglog(self.frequency_arr, plot_in, **kwargs)
+                plot_in *= _f_arr
+            ax_tmp.loglog(_f_arr, plot_in, **kwargs)
 
         return (fig, ax)
 

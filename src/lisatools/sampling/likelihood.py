@@ -1,7 +1,11 @@
+"""Likelihood wrappers for ``eryn`` samplers used in LISA analyses."""
+
 import warnings
-from eryn.state import Branch, BranchSupplemental
 
 import numpy as np
+from eryn.state import Branch, BranchSupplemental
+
+from ..utils.utility import asnumpy
 
 try:
     import cupy as cp
@@ -11,6 +15,55 @@ except (ModuleNotFoundError, ImportError):
 
 
 class Likelihood(object):
+    """Single-source Gaussian likelihood wrapper around a waveform generator.
+
+    Holds an injection (data + PSD), generates templates from
+    ``template_model``, and computes the standard frequency-domain
+    inner-product log-likelihood
+
+    .. math::
+
+        \\ln \\mathcal{L} = -\\tfrac{1}{2} \\, 4 \\, \\Delta f
+        \\sum_k \\frac{|d_k - h_k|^2}{S_n(f_k)}.
+
+    The class can run on CPU or GPU and can either compute the likelihood
+    directly or delegate to a ``template_model.get_ll`` method when the
+    underlying model exposes one.
+
+    Args:
+        template_model: Callable (or object with ``get_ll`` / ``__call__``)
+            that produces a multi-channel template given a parameter vector.
+        num_channels: Number of detector channels in the signal.
+        dt: Time step (s) for time-domain signals. Mutually exclusive with
+            ``df`` / ``f_arr``.
+        df: Constant frequency spacing (Hz) for frequency-domain signals.
+        f_arr: Frequency array (Hz) for non-uniformly-sampled
+            frequency-domain signals.
+        parameter_transforms: Mapping from model name to an
+            ``eryn`` ``TransformContainer`` applied to parameters before
+            evaluation.
+        use_gpu: If ``True``, use ``cupy`` and assume GPU-resident arrays.
+        vectorized: If ``True``, ``template_model`` is called once with the
+            full parameter batch; otherwise it is called per row.
+        separate_d_h: Reserved for splitting the likelihood into ``d_h`` and
+            ``h_h`` terms (currently raises ``NotImplementedError`` when
+            used).
+        return_cupy: If ``True`` and on GPU, return ``cupy`` arrays; if
+            ``False``, transfer to host.
+        fill_data_noise: If ``True``, supply ``data`` and ``psd`` to the
+            template model's ``get_ll``.
+        transpose_params: If ``True``, parameter arrays are transposed
+            before being indexed in batches.
+        subset: Optional integer batch size for splitting the parameter
+            evaluation into chunks.
+        adjust_psd: If ``True``, also vary the PSD; the second entry of a
+            list-valued ``params`` is interpreted as the PSD parameters and
+            an ``\\sum \\log S_n`` correction is added to the log-likelihood.
+
+    Raises:
+        ValueError: If none of ``dt``, ``df``, ``f_arr`` is provided.
+    """
+
     def __init__(
         self,
         template_model,
@@ -60,6 +113,7 @@ class Likelihood(object):
         self._specific_likelihood_setup()
 
     def _specific_likelihood_setup(self):
+        """Wire up either ``template_model.get_ll`` or the in-class likelihood."""
         if isinstance(self.template_model, list):
             raise ValueError("For single likelihood, template model cannot be a list.")
         if hasattr(self.template_model, "get_ll"):
@@ -82,6 +136,33 @@ class Likelihood(object):
         noise_kwargs={},
         add_noise=False,
     ):
+        """Build the data / PSD arrays used by subsequent likelihood calls.
+
+        Either generates an injection from ``params`` via ``template_model``,
+        or accepts a precomputed ``data_stream`` (per channel). The PSD is
+        evaluated from ``noise_fn`` per channel and stored on
+        ``self.psd``; the data is stored on ``self.injection_channels``.
+
+        Args:
+            data_stream: Pre-generated per-channel data list (alternative to
+                ``params``).
+            params: Parameter array passed to ``template_model`` to generate
+                the injection.
+            waveform_kwargs: Keyword arguments forwarded to
+                ``template_model``.
+            noise_fn: PSD callable, or list with one entry per channel.
+            noise_args: Positional args for ``noise_fn`` (or per-channel
+                list).
+            noise_kwargs: Keyword args for ``noise_fn`` (or per-channel
+                list).
+            add_noise: If ``True``, draw a noise realization from the PSD
+                and add it to the data (currently raises
+                ``NotImplementedError`` when triggered).
+
+        Raises:
+            ValueError: If neither ``params`` nor ``data_stream`` is given,
+                or if any input list has the wrong length.
+        """
         xp = cp if self.use_gpu else np
 
         if params is not None:
@@ -89,27 +170,17 @@ class Likelihood(object):
                 key = list(self.parameter_transforms.keys())[0]
                 params = self.parameter_transforms[key].both_transforms(params)
 
-            injection_channels = xp.asarray(
-                self.template_model(*params, **waveform_kwargs)
+            injection_channels = asnumpy(
+                xp.asarray(self.template_model(*params, **waveform_kwargs))
             )
-            try:
-                injection_channels = injection_channels.get()
-
-            except AttributeError:
-                pass
 
         elif data_stream is not None:
             if isinstance(data_stream, list) is False:
                 raise ValueError("If data_stream is provided, it must be as a list.")
-            try:
-                injection_channels = xp.asarray(data_stream).get()
-            except AttributeError:
-                injection_channels = np.asarray(data_stream)
+            injection_channels = asnumpy(xp.asarray(data_stream))
 
         else:
-            raise ValueError(
-                "Must provide data_stream or params kwargs to inject signal."
-            )
+            raise ValueError("Must provide data_stream or params kwargs to inject signal.")
 
         self.injection_length = len(injection_channels[0])
 
@@ -214,10 +285,7 @@ class Likelihood(object):
 
                 # TODO: need to check this
                 self.noise_likelihood_factor = np.sum(
-                    [
-                        1.0 / 2.0 * (2 * np.pi) * np.sum(diff_freqs * psd_temp)
-                        for psd_temp in psd
-                    ]
+                    [1.0 / 2.0 * (2 * np.pi) * np.sum(diff_freqs * psd_temp) for psd_temp in psd]
                 )
                 self.noise_has_been_added = True
 
@@ -260,6 +328,21 @@ class Likelihood(object):
         self.start_freq_ind = int(self.freqs[0] / self.df)
 
     def get_ll(self, params, data, psd, *args, **kwargs):
+        """Compute the Gaussian log-likelihood for a batch of parameter sets.
+
+        Args:
+            params: Parameter array (shape depends on ``vectorized`` and
+                ``transpose_params``).
+            data: Data array, or ``None`` to use ``self.injection_channels``.
+            psd: PSD array, or ``None`` to use ``self.psd``.
+            *args: Additional positional args forwarded to
+                ``template_model``.
+            **kwargs: Additional keyword args forwarded to
+                ``template_model``.
+
+        Returns:
+            Array of log-likelihood values, one per parameter set.
+        """
         xp = cp if self.use_gpu else np
 
         if psd is None:
@@ -271,9 +354,7 @@ class Likelihood(object):
         # TODO: make sure parameter transformations appear in posterior if possible
         num_likes = params.shape[0]
         if self.vectorized:
-            template_channels = xp.asarray(
-                self.template_model(*params, *args, **kwargs)
-            )
+            template_channels = xp.asarray(self.template_model(*params, *args, **kwargs))
 
         else:
             if isinstance(params[0], np.float64):
@@ -314,11 +395,7 @@ class Likelihood(object):
             ll = -(
                 1.0
                 / 2.0
-                * (
-                    4.0
-                    * self.df
-                    * xp.sum(((d_minus_h.conj() * d_minus_h) / psd).real, axis=(1, 2))
-                )
+                * (4.0 * self.df * xp.sum(((d_minus_h.conj() * d_minus_h) / psd).real, axis=(1, 2)))
             )
 
             if self.adjust_psd:
@@ -335,10 +412,7 @@ class Likelihood(object):
             if self.return_cupy:
                 return out
             else:
-                try:
-                    return out.get()
-                except AttributeError:
-                    return out
+                return asnumpy(out)
 
         else:
             return out
@@ -351,6 +425,24 @@ class Likelihood(object):
         noise_kwargs: list = None,
         noise_groups=None,
     ):
+        """Evaluate per-channel PSDs at ``f_arr`` from sampled noise parameters.
+
+        Args:
+            noise_params: Sampled noise parameters; first axis is the
+                "walker" / batch axis, second axis is parameter index.
+            f_arr: Frequency array to evaluate at (defaults to
+                ``self.freqs``).
+            noise_fn: Optional override for ``self.noise_fn``; one callable
+                per channel.
+            noise_kwargs: Optional override for ``self.noise_kwargs``; one
+                dict per channel.
+            noise_groups: Reserved for variable-leaf noise sampling; values
+                must be unique.
+
+        Returns:
+            Array of shape ``(nbatch, num_channels, len(f_arr))`` holding
+            the evaluated PSD.
+        """
         xp = cp if self.use_gpu else np
 
         if noise_groups is None:
@@ -380,6 +472,24 @@ class Likelihood(object):
         return psd
 
     def __call__(self, params, data=None, psd=None, *args, **kwargs):
+        """Apply parameter transforms / batching, then dispatch to :meth:`get_ll`.
+
+        Args:
+            params: Parameter array, or a length-2 list ``[params,
+                noise_params]`` when ``adjust_psd=True``.
+            data: Optional data override for the likelihood call.
+            psd: Optional PSD override; not allowed simultaneously with
+                noise parameters.
+            *args: Forwarded to the inner ``get_ll``.
+            **kwargs: Forwarded to the inner ``get_ll``.
+
+        Returns:
+            Concatenated log-likelihood values across all subset batches.
+
+        Raises:
+            ValueError: If ``params`` is malformed or if PSD inputs
+                conflict.
+        """
         xp = cp if self.use_gpu else np
         if isinstance(params, list):
             if len(params) != 2:
@@ -421,9 +531,9 @@ class Likelihood(object):
             params = self.parameter_transforms[keys[0]].both_transforms(params)
 
             if "noise_params" in keys:
-                noise_params = self.parameter_transforms[
-                    "noise_params"
-                ].both_transforms(noise_params)
+                noise_params = self.parameter_transforms["noise_params"].both_transforms(
+                    noise_params
+                )
 
         # only has to do with params, not noise params
         if self.transpose_params:
@@ -531,6 +641,25 @@ class Likelihood(object):
 
 
 class GlobalLikelihood(Likelihood):
+    """Multi-source extension of :class:`Likelihood` for the LISA global fit.
+
+    Accepts a list of template models, each with its own
+    ``parameter_transforms`` and ``vectorized`` flag, and combines their
+    contributions into a single residual ``data - sum(templates)`` before
+    computing the Gaussian log-likelihood. Templates may either return
+    waveform arrays (which are summed by group) or fill an externally
+    provided ``template_all`` buffer in place via
+    ``generate_global_template``.
+
+    Args:
+        *args: Forwarded to :class:`Likelihood`. ``template_model``,
+            ``parameter_transforms``, and ``vectorized`` will be wrapped
+            into lists if not already.
+        fill_templates: If ``True``, defer template assembly to each model's
+            ``generate_global_template`` method.
+        **kwargs: Forwarded to :class:`Likelihood`.
+    """
+
     def __init__(
         self,
         *args,
@@ -541,6 +670,7 @@ class GlobalLikelihood(Likelihood):
         self.fill_templates = fill_templates
 
     def _specific_likelihood_setup(self):
+        """Coerce ``template_model`` / ``parameter_transforms`` / ``vectorized`` to lists."""
         if not isinstance(self.template_model, list):
             self.template_model = [self.template_model]
 
@@ -550,11 +680,7 @@ class GlobalLikelihood(Likelihood):
         if not isinstance(self.vectorized, list):
             self.vectorized = [self.vectorized for _ in self.template_model]
 
-        assert (
-            len(self.template_model)
-            == len(self.parameter_transforms)
-            == len(self.vectorized)
-        )
+        assert len(self.template_model) == len(self.parameter_transforms) == len(self.vectorized)
 
         self.like_here = True
 
@@ -571,6 +697,30 @@ class GlobalLikelihood(Likelihood):
         supps=None,
         branch_supps=None,
     ):
+        """Compute the global-fit log-likelihood from a list of model parameter sets.
+
+        Args:
+            params: List of parameter arrays, one per template model.
+            groups: List of integer arrays mapping each row of the matching
+                ``params`` entry to a "group" index in the global template
+                buffer.
+            data: Frequency-domain data array.
+            psd: Frequency-domain PSD array.
+            data_length: Optional length override for the slice used in the
+                inner-product sum.
+            start_freq_ind: Optional starting frequency index override.
+            args_list: Optional per-model positional args.
+            kwargs_list: Optional per-model keyword args.
+            supps: Optional ``eryn`` supplementals dict; if it contains
+                ``"data_minus_template"`` it is used directly instead of
+                rebuilding the residual.
+            branch_supps: Optional list of per-model branch supplementals
+                forwarded to ``generate_global_template`` when
+                ``fill_templates`` is set.
+
+        Returns:
+            Array of log-likelihood values, one per group.
+        """
         # get supps
         if not isinstance(params, list):
             params = [params]
@@ -656,24 +806,17 @@ class GlobalLikelihood(Likelihood):
                 # TODO: make fill templates adjustable per model
                 if not self.fill_templates:  # False
                     if vec_i:
-                        template_channels = xp.asarray(
-                            tm_i(params_i, *args_i, **kwargs_i)
-                        )
+                        template_channels = xp.asarray(tm_i(params_i, *args_i, **kwargs_i))
 
                     else:
                         template_channels = xp.asarray(
-                            [
-                                tm_i(params_ij, *args_i, **kwargs_i)
-                                for params_ij in params_i.T
-                            ]
+                            [tm_i(params_ij, *args_i, **kwargs_i) for params_ij in params_i.T]
                         )
 
                     if self.frequency_domain is False:
                         # TODO: vectorize this
                         # 2: is removal of DC component + right summation approximation
-                        template_channels = (
-                            xp.fft.rfft(template_channels, axis=-1) * self.dt
-                        )
+                        template_channels = xp.fft.rfft(template_channels, axis=-1) * self.dt
 
                     # TODO: could put this in c?
                     for group_ij in np.unique(groups_i):
@@ -724,9 +867,7 @@ class GlobalLikelihood(Likelihood):
                 4.0
                 * self.df
                 * xp.sum(
-                    (
-                        d_minus_h[:, :, start_ind:].conj() * d_minus_h[:, :, start_ind:]
-                    ).real
+                    (d_minus_h[:, :, start_ind:].conj() * d_minus_h[:, :, start_ind:]).real
                     / psd[:, :, start_ind:],
                     axis=(1, 2),
                 )
@@ -745,15 +886,28 @@ class GlobalLikelihood(Likelihood):
             if self.return_cupy:
                 return out
             else:
-                try:
-                    return out.get()
-                except AttributeError:
-                    return out
+                return asnumpy(out)
 
         else:
             return out
 
     def __call__(self, params, groups, *args, data=None, psd=None, **kwargs):
+        """Apply per-model transforms and dispatch to :meth:`get_ll`.
+
+        Args:
+            params: ``np.ndarray`` or list of parameter arrays per model.
+                When ``adjust_psd`` is set, the last entry is interpreted as
+                noise parameters.
+            groups: ``np.ndarray`` or list of group-index arrays per model.
+            *args: Forwarded to :meth:`get_ll`.
+            data: Optional data override.
+            psd: Optional PSD override; ignored if noise parameters are
+                supplied.
+            **kwargs: Forwarded to :meth:`get_ll`.
+
+        Returns:
+            Array of log-likelihood values returned by :meth:`get_ll`.
+        """
         if isinstance(params, np.ndarray):
             params = [params]
         elif not isinstance(params, list):
@@ -768,9 +922,7 @@ class GlobalLikelihood(Likelihood):
         #    breakpoint()
 
         if self.parameter_transforms is not None:
-            for i, (params_i, transform_i) in enumerate(
-                zip(params, self.parameter_transforms)
-            ):
+            for i, (params_i, transform_i) in enumerate(zip(params, self.parameter_transforms)):
                 params[i] = transform_i.both_transforms(params_i.copy())
 
         else:

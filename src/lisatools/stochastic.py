@@ -1,11 +1,15 @@
+"""Stochastic foreground contributions to the LISA noise budget."""
+
 from __future__ import annotations
-import warnings
-from abc import ABC
-from typing import Any, Tuple, Optional, List, Dict
 
 import math
+import warnings
+from abc import ABC
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
 from scipy import interpolate
+from scipy.special import erfc
 
 try:
     import cupy as cp
@@ -14,8 +18,8 @@ except (ModuleNotFoundError, ImportError):
     import numpy as cp
 
 from . import detector as lisa_models
-from .utils.utility import AET
 from .utils.constants import *
+from .utils.utility import AET
 
 
 class StochasticContribution(ABC):
@@ -83,9 +87,7 @@ class StochasticContributionContainer:
 
     """
 
-    def __init__(
-        self, stochastic_contribution_dict: dict[StochasticContribution]
-    ) -> None:
+    def __init__(self, stochastic_contribution_dict: dict[StochasticContribution]) -> None:
         self.stochastic_contribution_dict = stochastic_contribution_dict
 
     @property
@@ -101,9 +103,7 @@ class StochasticContributionContainer:
         assert isinstance(stochastic_contribution_dict, dict)
         for key, value in stochastic_contribution_dict.items():
             if not isinstance(value, StochasticContribution):
-                raise ValueError(
-                    f"Stochastic model {key} is not of type StochasticContribution."
-                )
+                raise ValueError(f"Stochastic model {key} is not of type StochasticContribution.")
         self._stochastic_contribution_dict = stochastic_contribution_dict
 
     def get_Sh(
@@ -125,9 +125,7 @@ class StochasticContributionContainer:
         Sh_out = np.zeros_like(f)
         for key in params_dict:
             stochastic_contrib = self.stochastic_contribution_dict[key]
-            Sh_out += stochastic_contrib.get_Sh(
-                f, params_dict[key], **(kwargs_dict.get(key, {}))
-            )
+            Sh_out += stochastic_contrib.get_Sh(f, params_dict[key], **(kwargs_dict.get(key, {})))
         return Sh_out
 
     def __setitem__(self, key: str | int | tuple, val: StochasticContribution) -> None:
@@ -146,7 +144,7 @@ class HyperbolicTangentGalacticForeground(StochasticContribution):
 
     @staticmethod
     def specific_Sh_function(
-        f: float | np.ndarray, amp: float, fk: float, alpha: float, s1: float, s2: float
+        f: float | np.ndarray, amp: float, fk: float, alpha: float, f_1: float, f_2: float
     ) -> float | np.ndarray:
         """Hyperbolic tangent model 1 for the Galaxy foreground noise
 
@@ -154,19 +152,19 @@ class HyperbolicTangentGalacticForeground(StochasticContribution):
 
         .. math::
 
-            S_\\text{gal} = \\frac{A_\\text{gal}}{2}e^{-s_1f^\\alpha}f^{-7/3}\\left[ 1 + \\tanh{\\left(-s_2 (f - f_k)\\right)} \\right],
+            S_\\text{gal} = \\frac{A_\\text{gal}}{2}e^{-\\left(f/f_1\\right)^\\alpha}f^{-7/3}\\left[ 1 + \\tanh{\\left(-(f - f_k)/f_2\\right)} \\right],
 
         where :math:`A_\\text{gal}` is the amplitude of the stochastic signal, :math:`f_k` is the knee frequency at which a bend occurs,
-        math:`\\alpha` is a power law parameter, :math:`s_1` is a slope parameter below the knee,
-        and :math:`s_2` is a slope parameter after the knee.:
+        math:`\\alpha` is a power law parameter, :math:`f_1` sets the exponential roll-off scale,
+        and :math:`f_2` sets the transition width around the knee.
 
         Args:
             f: Frequency array.
             amp: Amplitude parameter for the Galaxy.
             fk: Knee frequency in Hz.
             alpha: Power law parameter.
-            s1: Slope parameter below knee.
-            s2: Slope parameter above knee.
+            f_1: Exponential scale-frequency parameter.
+            f_2: Hyperbolic-tangent transition scale-frequency parameter.
 
         Returns:
             PSD of the Galaxy foreground noise
@@ -174,17 +172,31 @@ class HyperbolicTangentGalacticForeground(StochasticContribution):
         """
         Sgal = (
             amp
-            * np.exp(-(f**alpha) * s1)
+            * np.exp(-((f / f_1) ** alpha))
             * (f ** (-7.0 / 3.0))
             * 0.5
-            * (1.0 + np.tanh(-(f - fk) * s2))
+            * (1.0 + np.tanh(-(f - fk) / f_2))
         )
 
         return Sgal
 
 
 class FittedHyperbolicTangentGalacticForeground(HyperbolicTangentGalacticForeground):
+    """Time-dependent fit of the Galactic confusion-foreground PSD.
+
+    Specializes :class:`HyperbolicTangentGalacticForeground` by interpolating
+    pre-fit values of the knee frequency and slope parameters as a function of
+    observation time ``Tobs``. The amplitude and power-law index are held fixed
+    at the values stored in the class attributes ``amp`` and ``alpha``.
+
+    The fit is only valid up to ``Tmax`` (10 years). The single free parameter
+    accepted by :meth:`specific_Sh_function` is the observation time in seconds.
+    """
+
     # TODO: need to verify this is still working
+    # TODO/DOCS: the time-dependent Galactic-foreground fit has not been re-validated
+    # against current data; the original TODO above flags this. Treat the numerical
+    # fit coefficients (knee, Slope1, Slope2, amp, alpha) as legacy values pending review.
     ndim = 1
     amp = 3.26651613e-44
     alpha = 1.18300266e00
@@ -211,7 +223,7 @@ class FittedHyperbolicTangentGalacticForeground(HyperbolicTangentGalacticForegro
         2.09278117e-03,
         1.57362626e-03,
     ]
-    Slope1 = [
+    _Slope1 = [
         9.41315118e02,
         1.36887568e03,
         1.68729474e03,
@@ -221,7 +233,7 @@ class FittedHyperbolicTangentGalacticForeground(HyperbolicTangentGalacticForegro
         3.74970124e03,
     ]
 
-    Slope2 = [
+    _Slope2 = [
         1.03239773e02,
         1.03351646e03,
         1.62204855e03,
@@ -230,12 +242,12 @@ class FittedHyperbolicTangentGalacticForeground(HyperbolicTangentGalacticForegro
         2.95774596e03,
         3.15199454e03,
     ]
+    F1 = [s ** (-1.0 / 1.18300266e00) for s in _Slope1]
+    F2 = [1.0 / s for s in _Slope2]
     Tmax = 10 * YRSID_SI
 
     @classmethod
-    def specific_Sh_function(
-        cls, f: float | np.ndarray, Tobs: float
-    ) -> float | np.ndarray:
+    def specific_Sh_function(cls, f: float | np.ndarray, Tobs: float) -> float | np.ndarray:
         """Fitted hyperbolic tangent model 1 for the Galaxy foreground noise.
 
         This class fits the parameters for :class:`HyperbolicTangentGalacticForeground`
@@ -258,21 +270,206 @@ class FittedHyperbolicTangentGalacticForeground(HyperbolicTangentGalacticForegro
         """
 
         if Tobs > cls.Tmax:
-            raise ValueError(
-                "Tobs is greater than the maximum allowable fit which is 10 years."
-            )
+            raise ValueError("Tobs is greater than the maximum allowable fit which is 10 years.")
 
         # Interpolate
-        tck1 = interpolate.splrep(cls.Xobs, cls.Slope1, s=0, k=1)
+        tck1 = interpolate.splrep(cls.Xobs, cls.F1, s=0, k=1)
         tck2 = interpolate.splrep(cls.Xobs, cls.knee, s=0, k=1)
-        tck3 = interpolate.splrep(cls.Xobs, cls.Slope2, s=0, k=1)
-        s1 = interpolate.splev(Tobs, tck1, der=0).item()
+        tck3 = interpolate.splrep(cls.Xobs, cls.F2, s=0, k=1)
+        f_1 = interpolate.splev(Tobs, tck1, der=0).item()
         fk = interpolate.splev(Tobs, tck2, der=0).item()
-        s2 = interpolate.splev(Tobs, tck3, der=0).item()
+        f_2 = interpolate.splev(Tobs, tck3, der=0).item()
 
         return HyperbolicTangentGalacticForeground.specific_Sh_function(
-            f, cls.amp, fk, cls.alpha, s1, s2
+            f, cls.amp, fk, cls.alpha, f_1, f_2
         )
+
+
+# --------------------------------------------------------------------------- #
+# Stochastic gravitational-wave background (SGWB) spectral templates.
+# --------------------------------------------------------------------------- #
+
+# Hubble constant [1/s]: H0 = 70 km/s/Mpc * 3.24078e-20 Mpc/km
+_SGWB_H0_SI = 70.0 * 3.24078e-20
+
+# common cosmology units to PSD factor
+SGWB_HSCALE = 3.0 * _SGWB_H0_SI**2 / (4.0 * np.pi**2)
+
+# c_g * Omega_{r,0} (radiation d.o.f. factor times present-day radiation energy density)
+# change the denominator if you change H0!
+SGWB_CGOR0 = 1.6e-5 / (0.7 * 0.7)
+
+class PowerLawSGWB(StochasticContribution):
+    """Power-law SGWB spectral template
+
+    .. math::
+
+        S_\\text{gw}(f) =  A\\,
+                          \\left(\\frac{f}{f_\\text{ref}}\\right)^{\\alpha},
+
+    with :math:`A = 10^{\\log_{10}A}` and :math:`f_\\text{ref}` =
+    :data:`SGWB_FREF`.
+    """
+
+    ndim = 2
+
+    @staticmethod
+    def specific_Sh_function(
+            f: float | np.ndarray, log10_A: float, alpha: float, fref: float = 25.0 #Hz
+    ) -> float | np.ndarray:
+        """Power-law SGWB.
+
+        Args:
+            f: Frequency array [Hz].
+            log10_A: Base-10 log of the amplitude at ``SGWB_FREF``.
+            alpha: Power-law spectral index.
+
+        Returns:
+            GW spectral density ``Sgw(f)`` (pre-response).
+        """
+        A = 10.0**log10_A
+        # Sgw ~ 1/f^3 diverges at f=0; return NaN there.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            prefactor = SGWB_HSCALE / (f * f * f)
+            Sgw = prefactor * A * (f / fref) ** alpha
+        return np.where(np.asarray(f) > 0.0, Sgw, np.nan)
+
+
+class LogNormalSGWB(StochasticContribution):
+    """Log-normal (scalar-induced) SGWB template
+
+    Pi & Sasaki, JCAP 2020 (arXiv:2005.12306), wide-:math:`\\Delta` limit,
+    eq. (3.29). For :math:`D \\geq 9` the closed form suffers catastrophic
+    cancellation, so the asymptotic numerical value (eq. 3.33) is used instead.
+
+    Parameters are ``(log10_A, log10_fstar, log10_D)``.
+    """
+
+    ndim = 3
+
+    @staticmethod
+    def specific_Sh_function(
+        f: float | np.ndarray, log10_A: float, log10_fstar: float, log10_D: float
+    ) -> float | np.ndarray:
+        """Log-normal SGWB (see class docstring for the reference).
+
+        Args:
+            f: Frequency array [Hz].
+            log10_A: Base-10 log of the (scalar) amplitude.
+            log10_fstar: Base-10 log of the peak frequency [Hz].
+            log10_D: Base-10 log of the (dimensionless) width :math:`D`.
+
+        Returns:
+            GW spectral density ``Sgw(f)`` (pre-response).
+        """
+        A = 10.0**log10_A
+        fstar = 10.0**log10_fstar
+        D = 10.0**log10_D
+        # Sgw ~ 1/f^3 (and log f) diverge at f=0; return NaN there (GLASS zeroes f=0).
+        f_pos = np.asarray(f) > 0.0
+        with np.errstate(divide="ignore", invalid="ignore"):
+            prefactor = SGWB_HSCALE / (f * f * f)
+            ft = f / fstar
+            if D < 9.0:
+                logft = np.log(ft)
+                logK = logft + 1.5 * D * D
+                sqrtpi = np.sqrt(np.pi)
+                half_log32 = 0.5 * np.log(1.5)
+                D2 = D * D
+                t1 = (
+                    4.0 / 5.0 / sqrtpi
+                    * ft**3
+                    * np.exp(9.0 * D2 / 4.0) / D
+                    * (
+                        (logK * logK + 0.5 * D2) * erfc((logK + half_log32) / D)
+                        - D / sqrtpi
+                        * np.exp(-((logK + half_log32) ** 2) / D2)
+                        * (logK - half_log32)
+                    )
+                )
+                t2 = (
+                    0.0659 / D2
+                    * ft**2
+                    * np.exp(D2)
+                    * np.exp(-((logft + D2 - 0.5 * np.log(4.0 / 3.0)) ** 2) / D2)
+                )
+                t3 = (
+                    (1.0 / 3.0) * np.sqrt(2.0) / sqrtpi
+                    * ft ** (-4)
+                    * np.exp(8.0 * D2) / D
+                    * np.exp(-(logft * logft) / (2.0 * D2))
+                    * erfc((4.0 * D2 - logft + np.log(4.0)) / (D * np.sqrt(2.0)))
+                )
+                Sgw = prefactor * SGWB_CGOR0 * A * A * (t1 + t2 + t3)
+            else:
+                # Numerical asymptote from Pi & Sasaki eq. (3.33).
+                Sgw = prefactor * SGWB_CGOR0 * A * A * 0.783 / 1e3
+        return np.where(f_pos, Sgw, np.nan)
+
+
+class PhaseTransitionSGWB(StochasticContribution):
+    """Phase-transition SGWB template.
+
+    Parameters are ``(rb, b, log10_Ap, log10_fp)`` with a double-broken
+    power-law shape.
+
+    See https://arxiv.org/abs/2209.13277
+
+    """
+
+    ndim = 4
+
+    @staticmethod
+    def specific_Sh_function(
+        f: float | np.ndarray, rb: float, b: float, log10_Ap: float, log10_fp: float
+    ) -> float | np.ndarray:
+        """Phase-transition SGWB.
+
+        Args:
+            f: Frequency array [Hz].
+            rb: Low-/high-frequency slope ratio parameter.
+            b: Spectral shape parameter.
+            log10_Ap: Base-10 log of the peak amplitude.
+            log10_fp: Base-10 log of the peak frequency [Hz].
+
+        Returns:
+            GW spectral density ``Sgw(f)`` (pre-response).
+        """
+        Ap = 10.0**log10_Ap
+        fp = 10.0**log10_fp
+        rb4 = rb * rb * rb * rb
+        m = (9.0 * rb4 + b) / (rb4 + 1.0)
+        # Sgw ~ 1/f^3 diverges at f=0 (and M is ill-defined there); return NaN
+        # at f=0 (GLASS zeroes f=0).
+        with np.errstate(divide="ignore", invalid="ignore"):
+            s = f / fp
+            s4 = s * s * s * s
+            s9 = s4 * s4 * s
+            M = (
+                s9
+                * ((1.0 + rb4) / (rb4 + s4)) ** ((9.0 - b) / 4.0)
+                * ((b + 4.0) / (b + 4.0 - m + m * s * s)) ** ((b + 4.0) / 2.0)
+            )
+            prefactor = SGWB_HSCALE / (f * f * f)
+            Sgw = Ap * M * prefactor
+        return np.where(np.asarray(f) > 0.0, Sgw, np.nan)
+
+
+__stock_sgwb_options__ = [
+    "PowerLawSGWB",
+    "LogNormalSGWB",
+    "PhaseTransitionSGWB",
+]
+
+
+def get_stock_sgwb_options() -> List[StochasticContribution]:
+    """Get stock options for SGWB spectral templates.
+
+    Returns:
+        List of stock SGWB template names.
+
+    """
+    return __stock_sgwb_options__
 
 
 __stock_gb_stochastic_options__ = [
@@ -301,7 +498,7 @@ def get_default_stochastic_from_str(stochastic: str) -> StochasticContribution:
         Stochastic contribution associated to that ``str``.
 
     """
-    if stochastic not in __stock_gb_stochastic_options__:
+    if stochastic not in (__stock_gb_stochastic_options__ + __stock_sgwb_options__):
         raise ValueError(
             "Requested string stochastic is not available. See lisatools.stochastic documentation."
         )

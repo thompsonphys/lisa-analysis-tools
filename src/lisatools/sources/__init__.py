@@ -1,6 +1,8 @@
+"""Waveform generators and calculation controllers for LISA source classes."""
+
 from .utils import (
-    CalculationController,
     BBHCalculationController,
-    GBCalculationController,
+    CalculationController,
     EMRICalculationController,
+    GBCalculationController,
 )

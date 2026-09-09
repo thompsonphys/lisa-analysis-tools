@@ -1,12 +1,13 @@
+"""Inner products, likelihood terms, and Fisher / covariance diagnostics."""
+
 from __future__ import annotations
+
 import warnings
-from typing import Optional, Any, Tuple, List
+from typing import Any, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
-
-from eryn.utils import TransformContainer
-
 import numpy as np
+from eryn.utils import TransformContainer
 
 try:
     import cupy as cp
@@ -16,17 +17,16 @@ except (ModuleNotFoundError, ImportError):
 
     pass
 
-from .sensitivity import get_sensitivity, SensitivityMatrix
+from . import domains
 from .datacontainer import DataResidualArray
+from .sensitivity import SensitivityMatrix, SensitivityMatrixBase, get_sensitivity
 from .utils.utility import get_array_module
 
 
 def inner_product(
     sig1: np.ndarray | list | DataResidualArray,
     sig2: np.ndarray | list | DataResidualArray,
-    dt: Optional[float] = None,
-    df: Optional[float] = None,
-    f_arr: Optional[float] = None,
+    basis_settings: domains.DomainSettingsBase = None,
     psd: Optional[str | None | np.ndarray | SensitivityMatrix] = "LISASens",
     psd_args: Optional[tuple] = (),
     psd_kwargs: Optional[dict] = {},
@@ -56,9 +56,9 @@ def inner_product(
             Can be time-domain or frequency-domain.
             Must be 1D ``np.ndarray``, list of 1D ``np.ndarray``s, or 2D ``np.ndarray``
             across channels with shape ``(nchannels, data length)``.
-        dt: Time step in seconds. If provided, assumes time-domain signals.
-        df: Constant frequency spacing. This will assume a frequency domain signal with constant frequency spacing.
-        f_arr: Array of specific frequencies at which the signal is given.
+        basis_settings: :class:`~lisatools.domains.DomainSettingsBase` describing the
+            domain of ``sig1`` / ``sig2`` (only consulted when raw arrays are passed
+            instead of :class:`~lisatools.datacontainer.DataResidualArray` objects).
         psd: Indicator of what psd to use. If a ``str``, this will be passed as the ``sens_fn`` kwarg to :func:`get_sensitivity`.
             If ``None``, it will be an array of ones. Or, you can pass a 1D ``np.ndarray`` of psd values that must be the same length
             as the frequency domain signals.
@@ -72,14 +72,30 @@ def inner_product(
         Inner product value.
 
     """
-    # initial input checks and setup
-    sig1 = DataResidualArray(sig1, dt=dt, f_arr=f_arr, df=df)
-    sig2 = DataResidualArray(sig2, dt=dt, f_arr=f_arr, df=df)
+    # initial input checks and setup -- accept DomainBase directly to avoid
+    # the DataResidualArray deprecation chatter; only wrap raw arrays.
+    def _coerce(sig):
+        if isinstance(sig, domains.DomainBase):
+            return sig
+        if isinstance(sig, DataResidualArray):
+            return sig.data_res_arr
+        if basis_settings is None:
+            raise ValueError(
+                "inner_product: raw-array inputs require ``basis_settings``."
+            )
+        xp = get_array_module(sig)
+        arr = xp.atleast_2d(sig)
+        return basis_settings.associated_class(arr, basis_settings)
+
+    sig1 = _coerce(sig1)
+    sig2 = _coerce(sig2)
 
     if sig1.nchannels != sig2.nchannels:
         raise ValueError(
             f"Signal 1 has {sig1.nchannels} channels. Signal 2 has {sig2.nchannels} channels. Must be the same."
         )
+    
+    nchannels = sig1.nchannels
 
     xp = get_array_module(sig1[0])
 
@@ -90,37 +106,51 @@ def inner_product(
                 "Array in sig1, index 0 sets array module. Not all arrays match that module type (Numpy or Cupy)"
             )
 
-    if sig1.data_length != sig2.data_length:
+    if sig1.data_shape != sig2.data_shape:
         raise ValueError(
             "The two signals are two different lengths. Must be the same length."
         )
 
-    freqs = xp.asarray(sig1.f_arr)
+    basis = sig1.data_res_arr.settings
 
-    # get psd weighting
-    if not isinstance(psd, SensitivityMatrix):
-        psd = SensitivityMatrix(freqs, [psd], *psd_args, **psd_kwargs)
+    # get psd weighting. ``XYZSensitivityBackend`` and friends are
+    # ``SensitivityMatrixBase`` subclasses but not ``SensitivityMatrix``
+    # — accept anything in the base hierarchy so callers can pass a
+    # backend-built matrix directly.
+    if not isinstance(psd, SensitivityMatrixBase):
+        psd = SensitivityMatrix(basis, [psd], *psd_args, **psd_kwargs)
+
+    else:
+        if psd.basis_settings != basis:
+            raise ValueError("PSD basis is not equivalent to signal basis.")
+        
+        for i in list(psd.channel_shape):
+            if i != nchannels:
+                raise ValueError("Number of channels in PSD not equal to number of channels in signal.")
 
     operational_sets = []
 
-    if psd.ndim == 3:
+    if len(psd.channel_shape) == 2:
         assert psd.shape[0] == psd.shape[1] == sig1.shape[0] == sig2.shape[0]
 
+        # this avoids 9 inner products for 6 (with symmetry)
         for i in range(psd.shape[0]):
-            for j in range(psd.shape[0]):  # i, psd.shape[1]):
-                factor = 1.0  # if i == j else 2.0
+            # for j in range(i, psd.shape[1]):
+            #     factor = 1.0 if i == j else 2.0
+            #     operational_sets.append(
+            #         dict(factor=factor, sig1_ind=i, sig2_ind=j, psd_ind=(i, j))
+            #     )
+            # TODO: this could be faster?
+            for j in range(psd.shape[1]):  # i, psd.shape[1]):
+                factor = 1.0  #  if i == j else -1.0  # 2.0
                 operational_sets.append(
                     dict(factor=factor, sig1_ind=i, sig2_ind=j, psd_ind=(i, j))
                 )
 
-    elif psd.ndim == 2 and psd.shape[0] > 1:
+    elif len(psd.channel_shape) == 1:
         assert psd.shape[0] == sig1.shape[0] == sig2.shape[0]
         for i in range(psd.shape[0]):
             operational_sets.append(dict(factor=1.0, sig1_ind=i, sig2_ind=i, psd_ind=i))
-
-    elif psd.ndim == 2 and psd.shape[0] == 1:
-        for i in range(sig1.shape[0]):
-            operational_sets.append(dict(factor=1.0, sig1_ind=i, sig2_ind=i, psd_ind=0))
 
     else:
         raise ValueError("# TODO")
@@ -132,25 +162,63 @@ def inner_product(
 
     # initialize
     out = 0.0
-    x = freqs
+    # x = freqs
 
+    tmp = []
     # account for hp and hx if included in time domain signal
     for op_set in operational_sets:
         factor = op_set["factor"]
-
         temp1 = sig1[op_set["sig1_ind"]]
         temp2 = sig2[op_set["sig2_ind"]]
         inv_psd_tmp = psd.invC[op_set["psd_ind"]]
 
-        ind_start = 1 if np.isnan(inv_psd_tmp[0]) else 0
+        if hasattr(sig1.data_res_arr, "apply_frequency_layer_mask") or hasattr(sig2.data_res_arr, "apply_frequency_layer_mask"):
+            if hasattr(sig1.data_res_arr, "apply_frequency_layer_mask") and hasattr(sig2.data_res_arr, "apply_frequency_layer_mask"):
+                if sig1.data_res_arr.frequency_layer_mask is not None and sig2.data_res_arr.frequency_layer_mask is not None:
+                    if not np.array_equal(sig1.data_res_arr.frequency_layer_mask, sig2.data_res_arr.frequency_layer_mask):
+                        raise ValueError("If both signals have a frequency layer mask, they must be the same.")
+                func_apply = sig1.data_res_arr.apply_frequency_layer_mask
+            elif hasattr(sig1.data_res_arr, "apply_frequency_layer_mask") and sig1.data_res_arr.frequency_layer_mask is not None:
+                func_apply = sig1.data_res_arr.apply_frequency_layer_mask
+            elif hasattr(sig2.data_res_arr, "apply_frequency_layer_mask") and sig2.data_res_arr.frequency_layer_mask is not None:
+                func_apply = sig2.data_res_arr.apply_frequency_layer_mask
+
+            temp1 = func_apply(temp1)
+            temp2 = func_apply(temp2)
+            inv_psd_tmp = func_apply(inv_psd_tmp)  # should be the same for sig1 and sig2 if they have the method
+        
+        # fix nan in first spot if it is there
+        if True:  # inv_psd_tmp.ndim == 1 or :
+            ind_start = 1 if np.any(np.isnan(inv_psd_tmp[0])) else 0
+            sig_component_1 = temp1[ind_start:]
+            sig_component_2 = temp2[ind_start:]
+            inv_psd_component = inv_psd_tmp[ind_start:]
+
+        # elif inv_psd_tmp.ndim == 2:
+        #     ind_start = 1 if np.isnan(inv_psd_tmp[0, 0]) else 0
+        #     sig_component_1 = temp1[ind_start:]
+        #     sig_component_2 = temp2[ind_start:]
+        #     inv_psd_component = inv_psd_tmp[ind_start:]
+
+        else:
+            raise ValueError(f"Component PSDs must be 1D or 2D. This has ndim {inv_psd_component.ndim}.")
 
         y = (
-            func(temp1[ind_start:].conj() * temp2[ind_start:]) * inv_psd_tmp[ind_start:]
+            func(sig_component_1.conj() * sig_component_2 * inv_psd_component)
         )  # assumes right summation rule
-        # df is sunk into trapz
-        tmp_out = factor * 4 * xp.trapz(y, x=x[ind_start:])
+
+        # switching to summation for comp to other domains
+        tmp_out = factor * 4 * xp.sum(y) * psd.differential_component
+        # y = (
+        #     func((sig_component_1.conj() * sig_component_2) + (sig_component_2.conj() * sig_component_1)) * inv_psd_component
+        # )  # assumes right summation rule
+        # # switching to summation for comp to other domains
+        # # I CHANGED THE 4 to a 2 and put in the complex components above for CSD issue (# TODO: check this)
+        # tmp_out = factor * 2 * xp.sum(y) * psd.differential_component
+        tmp.append(tmp_out)
         out += tmp_out
 
+    tmp = xp.asarray(tmp)
     # normalize the inner produce
     normalization_value = 1.0
     if normalize is True:
@@ -193,14 +261,22 @@ def inner_product(
 
     out /= normalization_value
 
-    # remove from cupy if needed
+    # remove from cupy if needed -- but skip the concretization for jax
+    # arrays / tracers (calling ``.item()`` inside ``jax.grad`` raises a
+    # ``ConcretizationTypeError`` and would drop the trace).
     try:
-        out = out.item()
-    except AttributeError:
-        pass
+        import jax
+        _is_jax = isinstance(out, (jax.Array, jax.core.Tracer))
+    except (ImportError, ModuleNotFoundError):
+        _is_jax = False
+    if not _is_jax:
+        try:
+            out = out.item()
+        except AttributeError:
+            pass
 
     # add copy function to complex value for compatibility
-    if complex:
+    if complex and not _is_jax:
         out = np.complex128(out)
 
     return out
@@ -230,7 +306,7 @@ def residual_source_likelihood_term(
     return -1 / 2.0 * ip_val
 
 
-def noise_likelihood_term(psd: SensitivityMatrix) -> float:
+def noise_likelihood_term(psd: SensitivityMatrixBase) -> float:
     """Calculate the noise term in the Likelihood.
 
     The noise term in the likelihood is given by,
@@ -247,17 +323,22 @@ def noise_likelihood_term(psd: SensitivityMatrix) -> float:
 
     """
     fix = np.isnan(psd[:]) | np.isinf(psd[:])
-    assert np.sum(fix) == np.prod(psd.shape[:-1]) or np.sum(fix) == 0
+
+    # assert np.sum(fix) == np.prod(psd.shape[:len(psd.basis_settings.basis_shape)]) or np.sum(fix) == 0, f"sum fix: {np.sum(fix)}; psd shape: {psd.shape}; basis shape: {psd.basis_settings.basis_shape}" #todo fix this
+    assert (
+        np.sum(fix) == np.prod(psd.shape[:-1]) or np.sum(fix) == 0
+    ), f"sum fix: {np.sum(fix)}; psd shape: {psd.shape}; basis shape: {psd.basis_settings.basis_shape}"
     # TODO: check on this / add warning
     detC = psd.detC
     keep = (detC != 0.0) & (~np.isinf(detC)) & (~np.isnan(detC))
+
     nl_val = -np.sum(np.log(np.abs(detC[keep])))
     return nl_val
 
 
 def residual_full_source_and_noise_likelihood(
     data_res_arr: DataResidualArray,
-    psd: str | None | np.ndarray | SensitivityMatrix,
+    psd: str | None | np.ndarray | SensitivityMatrixBase,
     **kwargs: dict,
 ) -> float | complex:
     """Calculate the full Likelihood including noise and source terms.
@@ -275,9 +356,10 @@ def residual_full_source_and_noise_likelihood(
        Full Likelihood value.
 
     """
-    if not isinstance(psd, SensitivityMatrix):
+    if not isinstance(psd, SensitivityMatrixBase):
         # TODO: maybe adjust so it can take a list just like Sensitivity matrix
-        psd = SensitivityMatrix(data_res_arr.f_arr, [psd], **kwargs)
+        basis = data_res_arr.data_res_arr.settings
+        psd = SensitivityMatrix(basis, [psd], **kwargs)
 
     # remove key
     for key in "psd", "psd_args", "psd_kwargs":
@@ -320,7 +402,7 @@ def data_signal_source_likelihood_term(
 def data_signal_full_source_and_noise_likelihood(
     data_arr: DataResidualArray,
     sig_arr: DataResidualArray,
-    psd: str | None | np.ndarray | SensitivityMatrix,
+    psd: str | None | np.ndarray | SensitivityMatrixBase,
     **kwargs: dict,
 ) -> float | complex:
     """Calculate the full Likelihood including noise and source terms.
@@ -341,9 +423,10 @@ def data_signal_full_source_and_noise_likelihood(
        Full Likelihood value.
 
     """
-    if not isinstance(psd, SensitivityMatrix):
+    if not isinstance(psd, SensitivityMatrixBase):
         # TODO: maybe adjust so it can take a list just like Sensitivity matrix
-        psd = SensitivityMatrix(data_arr.f_arr, [psd], **kwargs)
+        basis = data_arr.data_res_arr.settings
+        psd = SensitivityMatrix(basis, [psd], **kwargs)
 
     # remove key
     for key in "psd", "psd_args", "psd_kwargs":
@@ -406,14 +489,14 @@ def h_var_p_eps(
     waveform_args: Optional[tuple] = (),
     waveform_kwargs: Optional[dict] = {},
 ) -> np.ndarray:  # TODO: check this
-    """Calculate the waveform with a perturbation step of the variable V[i]
+    """Calculate the waveform with a perturbation step of the variable V[i].
 
     Args:
         waveform_model: Callable function to the waveform generator with signature ``(*params, **waveform_kwargs)``.
         params: Source parameters that are over derivatives (not in fill dict of parameter transforms)
         step: Absolute step size for variable of interest.
         index: Index to parameter of interest.
-        parameter_transforms: `TransformContainer <https://mikekatz04.github.io/Eryn/user/utils.html#eryn.utils.TransformContainer>`_ object to transform from the derivative parameter basis
+        parameter_transforms: `TransformContainer <https://lisa-analysis-tools.github.io/Eryn/user/utils.html#eryn.utils.TransformContainer>`_ object to transform from the derivative parameter basis
             to the waveform parameter basis. This class can also fill in fixed parameters where the derivatives are not being taken.
         waveform_args: args (beyond parameters) for the waveform generator.
         waveform_kwargs: kwargs for the waveform generation.
@@ -427,9 +510,7 @@ def h_var_p_eps(
 
     if parameter_transforms is not None:
         # transform
-        params_p_eps = parameter_transforms.transform_base_parameters(
-            params_p_eps[None, :]
-        )[0]
+        params_p_eps = parameter_transforms.transform_base_parameters(params_p_eps[None, :])[0]
 
     args_in = tuple(params_p_eps) + tuple(waveform_args)
     dh = waveform_model(*args_in, **waveform_kwargs)
@@ -453,7 +534,7 @@ def dh_dlambda(
     more_accurate: Optional[bool] = True,
     **kwargs: dict,
 ) -> np.ndarray:
-    """Derivative of the waveform
+    """Derivative of the waveform.
 
     Calculate the derivative of the waveform with precision of order (step^4)
     with respect to the variable V in the i direction.
@@ -692,9 +773,7 @@ def plot_covariance_corner(
     try:
         import corner
     except ModuleNotFoundError:
-        raise ValueError(
-            "Attempting to plot using the corner module, but it is not installed."
-        )
+        raise ValueError("Attempting to plot using the corner module, but it is not installed.")
 
     # generate fake samples from the covariance distribution
     samp = np.random.multivariate_normal(params, cov, size=nsamp)
@@ -833,7 +912,7 @@ def cutler_vallisneri_bias(
         deriv_inds: Subset of parameters of interest. See :func:`info_matrix`.
         return_derivs: If ``True``, also returns computed numerical derivatives.
         return_cov: If ``True``, also returns computed covariance matrix.
-        parameter_transforms: `TransformContainer <https://mikekatz04.github.io/Eryn/user/utils.html#eryn.utils.TransformContainer>`_ object. See :func:`info_matrix`.
+        parameter_transforms: `TransformContainer <https://lisa-analysis-tools.github.io/Eryn/user/utils.html#eryn.utils.TransformContainer>`_ object. See :func:`info_matrix`.
         waveform_true_args: Arguments for the **true** waveform generator.
         waveform_true_kwargs: Keyword arguments for the **true** waveform generator.
         waveform_approx_args: Arguments for the **approximate** waveform generator.
@@ -850,9 +929,7 @@ def cutler_vallisneri_bias(
         deriv_inds = np.arange(len(params))
 
     if info_mat is not None and input_diagnostics is not None:
-        warnings.warn(
-            "Provided info_mat and input_diagnostics kwargs. Ignoring info_mat."
-        )
+        warnings.warn("Provided info_mat and input_diagnostics kwargs. Ignoring info_mat.")
 
     # adjust parameters to waveform basis
     params_in = parameter_transforms.transform_base_parameters(params.copy())
@@ -900,9 +977,7 @@ def cutler_vallisneri_bias(
         h_approx = list(h_approx)
 
     assert len(h_approx) == len(h_true)
-    assert np.all(
-        np.asarray([len(h_approx[i]) == len(h_true[i]) for i in range(len(h_true))])
-    )
+    assert np.all(np.asarray([len(h_approx[i]) == len(h_true[i]) for i in range(len(h_true))]))
 
     # difference in the waveforms
     diff = [h_true[i] - h_approx[i] for i in range(len(h_approx))]

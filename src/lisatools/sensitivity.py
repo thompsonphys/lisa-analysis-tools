@@ -1,34 +1,60 @@
+"""LISA PSD / sensitivity matrices, TDI noise channels, and PSD utilities.
+
+The sensitivity code is heavily based on an original code by
+Stas Babak and Antoine Petiteau for the LDC team.
+"""
+
 from __future__ import annotations
-import warnings
-from abc import ABC
-from typing import Any, Tuple, Optional, List
-from copy import deepcopy
-import os
 
 import math
+import operator
+import os
+import warnings
+from abc import ABC
+from copy import deepcopy
+from typing import Any, Callable, List, Optional, Sequence, Tuple, TYPE_CHECKING
+
+from logging import getLogger
+import matplotlib.pyplot as plt
 import numpy as np
 from scipy import interpolate
-import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter1d as np_gaussian_filter1d
+from scipy.signal import find_peaks
+
+from .utils.utility import asnumpy, get_array_module
+
+from . import domains
 
 try:
     import cupy as cp
+    from cupyx.scipy.ndimage import gaussian_filter1d as cp_gaussian_filter1d
 
 except (ModuleNotFoundError, ImportError):
     import numpy as cp
 
+    cp_gaussian_filter1d = np_gaussian_filter1d
+
+from cudakima import AkimaInterpolant1D
+
 from . import detector as lisa_models
-from .utils.utility import AET, get_array_module
-from .utils.constants import *
+from .detector import L1Orbits, Orbits
+from .domains import DomainSettingsBase
 from .stochastic import (
-    StochasticContribution,
     FittedHyperbolicTangentGalacticForeground,
+    HyperbolicTangentGalacticForeground,
+    StochasticContribution,
     check_stochastic,
 )
+from .utils.constants import *
+from .utils.parallelbase import LISAToolsParallelModule
+from .utils.utility import AET, get_array_module
 
-"""
-The sensitivity code is heavily based on an original code by Stas Babak, Antoine Petiteau for the LDC team.
-"""
+if TYPE_CHECKING:
+    from .utils.typing import NDArrayLike, ArrayModule
 
+logger = getLogger(__name__)
+
+NUM_SPLINE_THREADS = 256
 
 class Sensitivity(ABC):
     """Base Class for PSD information.
@@ -47,9 +73,7 @@ class Sensitivity(ABC):
         except ValueError:
             if isinstance(array, float):
                 return np
-            raise ValueError(
-                "array must be a numpy or cupy array (it can be a float as well)."
-            )
+            raise ValueError("array must be a numpy or cupy array (it can be a float as well).")
 
     @staticmethod
     def transform(
@@ -75,6 +99,7 @@ class Sensitivity(ABC):
         cls,
         f: float | np.ndarray,
         model: Optional[lisa_models.LISAModel | str] = lisa_models.sangria,
+        include_instrument: bool = True,
         **kwargs: dict,
     ) -> float | np.ndarray:
         """Calculate the PSD
@@ -97,39 +122,44 @@ class Sensitivity(ABC):
                     "T": CubicSpline(f, Sn_T))
                 }
                 ```
+            include_instrument: If ``True`` (default), include the instrument
+                noise term. If ``False``, return only the (transformed) stochastic
+                contribution — ``model`` is then unused. Used to build
+                stochastic-only covariance components (galactic foreground, SGWB).
             **kwargs: For interoperability.
 
         Returns:
             PSD values.
 
         """
-        # spline or stock computation
-        if hasattr(model, "Sn_spl") and model.Sn_spl is not None:
-            spl = model.Sn_spl
-            if cls.channel not in spl:
-                raise ValueError("Calling a channel that is not available.")
+        if include_instrument:
+            # spline or stock computation
+            if hasattr(model, "Sn_spl") and model.Sn_spl is not None:
+                spl = model.Sn_spl
+                if cls.channel not in spl:
+                    raise ValueError("Calling a channel that is not available.")
 
-            Sout = spl[cls.channel](f)
+                Sout = spl[cls.channel](f)
 
+            else:
+                model = lisa_models.check_lisa_model(model)
+                # assert hasattr(model, "Soms_d") and hasattr(model, "Sa_a")
+
+                # get noise values
+                noise_levels = model.lisanoises(f)
+
+                # transform as desired for TDI combination
+                Sout = cls.transform(f, noise_levels, **kwargs)
         else:
-            model = lisa_models.check_lisa_model(model)
-            # assert hasattr(model, "Soms_d") and hasattr(model, "Sa_a")
-
-            # get noise values
-            noise_levels = model.lisanoises(f)
-
-            # transform as desired for TDI combination
-            Sout = cls.transform(f, noise_levels, **kwargs)
+            # stochastic-only: skip the instrument term entirely (no model needed)
+            Sout = 0.0
 
         # will add zero if ignored
         stochastic_contribution = cls.stochastic_transform(
             f, cls.get_stochastic_contribution(f, **kwargs), **kwargs
         )
 
-        try:
-            Sout += stochastic_contribution
-        except:
-            breakpoint()
+        Sout += stochastic_contribution
         return Sout
 
     @classmethod
@@ -147,8 +177,10 @@ class Sensitivity(ABC):
         sensitivity contribution. The ``transform_factor`` can transform that
         output to the correct TDI contribution.
 
+        This function has GPU capabilities if a Cupy frequency array is entered.
+
         Args:
-            f: Frequency array.
+            f: Frequency array. If a Cupy array is provided, the GPU is used.
             stochastic_params: Parameters (arguments) to feed to ``stochastic_function``.
             stochastic_kwargs: Keyword arguments to feeed to ``stochastic_function``.
             stochastic_function: Stochastic class or string name of stochastic class. Takes ``stochastic_args`` and ``stochastic_kwargs``.
@@ -169,18 +201,17 @@ class Sensitivity(ABC):
         sgal = xp.zeros_like(f)
 
         if (
-            (stochastic_params != () and stochastic_params is not None)
+            (tuple(stochastic_params) != tuple() and stochastic_params is not None)
             or (stochastic_kwargs != {} and stochastic_kwargs is not None)
             or stochastic_function is not None
         ):
             if stochastic_function is None:
                 stochastic_function = FittedHyperbolicTangentGalacticForeground
+                assert len(stochastic_params) == 1
 
             stochastic_function = check_stochastic(stochastic_function)
 
-            sgal[:] = stochastic_function.get_Sh(
-                f, *stochastic_params, **stochastic_kwargs
-            )
+            sgal[:] = stochastic_function.get_Sh(f, *stochastic_params, **stochastic_kwargs)
 
         if squeeze:
             sgal = sgal.squeeze()
@@ -207,22 +238,24 @@ class Sensitivity(ABC):
 
 
 class X1TDISens(Sensitivity):
+    """Sensitivity for the TDI 1.5 X channel."""
+
     channel: str = "X"
 
     @staticmethod
     def Cxx(f: float | np.ndarray) -> float | np.ndarray:
-        """Common TDI transform factor.
-        
+        """Common TDI 1.5 X auto-spectrum transfer factor.
+
         Args:
             f: Frequencyies to evaluate.
 
         Returns:
             Cxx: Transform factor.
-        
+
         """
         x = 2 * np.pi * f * L_SI / C_SI
         return 16.0 * np.sin(x) ** 2
-                                 
+
     @staticmethod
     def transform(
         f: float | np.ndarray,
@@ -244,16 +277,23 @@ class X1TDISens(Sensitivity):
         tm_transfer = Cxx * (2.0 * (1.0 + np.cos(x) ** 2))
         rfi_backlink_transfer = Cxx
         tmi_backlink_transfer = Cxx * (2.0 * (1.0 + np.cos(x) ** 2))
-        
+
         isi_oms_ffd = isi_rfi_readout_transfer * noise_levels.isi_oms_noise
         rfi_oms_ffd = isi_rfi_readout_transfer * noise_levels.rfi_oms_noise
         tmi_oms_ffd = tmi_readout_transfer * noise_levels.tmi_oms_noise
         tm_noise_ffd = tm_transfer * noise_levels.tm_noise
-        
+
         rfi_backlink_ffd = rfi_backlink_transfer * noise_levels.rfi_backlink_noise
         tmi_backlink_ffd = tmi_backlink_transfer * noise_levels.tmi_backlink_noise
 
-        total_noise = tm_noise_ffd + isi_oms_ffd + rfi_oms_ffd + tmi_oms_ffd + rfi_backlink_ffd + tmi_backlink_ffd
+        total_noise = (
+            tm_noise_ffd
+            + isi_oms_ffd
+            + rfi_oms_ffd
+            + tmi_oms_ffd
+            + rfi_backlink_ffd
+            + tmi_backlink_ffd
+        )
         return total_noise
 
     @staticmethod
@@ -268,10 +308,12 @@ class X1TDISens(Sensitivity):
         t = 4.0 * x**2 * np.sin(x) ** 2
         return Sh * t
 
+
 class Y1TDISens(X1TDISens):
     channel: str = "Y"
     __doc__ = X1TDISens.__doc__
     pass
+
 
 class Z1TDISens(X1TDISens):
     channel: str = "Z"
@@ -280,18 +322,20 @@ class Z1TDISens(X1TDISens):
 
 
 class XY1TDISens(Sensitivity):
+    """Sensitivity for the TDI 1.5 XY cross-spectrum channel."""
+
     channel: str = "XY"
 
     @staticmethod
     def Cxy(f: float | np.ndarray) -> float | np.ndarray:
         """Common TDI transform factor for CSD.
-        
+
         Args:
             f: Frequencyies to evaluate.
 
         Returns:
             Cxy: Transform factor.
-        
+
         """
         x = 2 * np.pi * f * L_SI / C_SI
         return -4.0 * np.sin(2 * x) * np.sin(x)
@@ -320,11 +364,18 @@ class XY1TDISens(Sensitivity):
         rfi_oms_ffd = isi_rfi_readout_transfer * noise_levels.rfi_oms_noise
         tmi_oms_ffd = tmi_readout_transfer * noise_levels.tmi_oms_noise
         tm_noise_ffd = tm_transfer * noise_levels.tm_noise
-        
+
         rfi_backlink_ffd = rfi_backlink_transfer * noise_levels.rfi_backlink_noise
         tmi_backlink_ffd = tmi_backlink_transfer * noise_levels.tmi_backlink_noise
 
-        total_noise = tm_noise_ffd + isi_oms_ffd + rfi_oms_ffd + tmi_oms_ffd + rfi_backlink_ffd + tmi_backlink_ffd
+        total_noise = (
+            tm_noise_ffd
+            + isi_oms_ffd
+            + rfi_oms_ffd
+            + tmi_oms_ffd
+            + rfi_backlink_ffd
+            + tmi_backlink_ffd
+        )
         return total_noise
 
     @staticmethod
@@ -355,23 +406,27 @@ class YZ1TDISens(XY1TDISens):
 
 
 class X2TDISens(Sensitivity):
+    """Sensitivity for the TDI 2.0 X channel."""
+
     channel: str = "X"
 
     @staticmethod
     def Cxx(f: float | np.ndarray) -> float | np.ndarray:
         """Common TDI transform factor.
 
-        `arXiv:2211.02539 <https://arxiv.org/pdf/2211.02539>`_. 
-        
+        `arXiv:2211.02539 <https://arxiv.org/pdf/2211.02539>`_.
+
         Args:
             f: Frequencyies to evaluate.
 
         Returns:
             Cxx: Transform factor.
-        
+
         """
         x = 2 * np.pi * f * L_SI / C_SI
-        return 16. * np.sin(x) ** 2 * np.sin(2 * x) ** 2  # np.abs(1. - np.exp(-2j * np.pi * f * L_SI / C_SI) ** 2) ** 2
+        return (
+            16.0 * np.sin(x) ** 2 * np.sin(2 * x) ** 2
+        )  # np.abs(1. - np.exp(-2j * np.pi * f * L_SI / C_SI) ** 2) ** 2
 
     @staticmethod
     def transform(
@@ -389,21 +444,28 @@ class X2TDISens(Sensitivity):
 
         x = 2 * np.pi * f * L_SI / C_SI
 
-        isi_rfi_readout_transfer = 4. * Cxx
-        tmi_readout_transfer = Cxx * (3 + np.cos(2 * x)) 
-        tm_transfer = 4 * Cxx * (3 + np.cos(2 * x)) 
+        isi_rfi_readout_transfer = 4.0 * Cxx
+        tmi_readout_transfer = Cxx * (3 + np.cos(2 * x))
+        tm_transfer = 4 * Cxx * (3 + np.cos(2 * x))
         rfi_backlink_transfer = 4 * Cxx
-        tmi_backlink_transfer = Cxx * (3 + np.cos(2 * x)) 
- 
+        tmi_backlink_transfer = Cxx * (3 + np.cos(2 * x))
+
         isi_oms_ffd = isi_rfi_readout_transfer * noise_levels.isi_oms_noise
         rfi_oms_ffd = isi_rfi_readout_transfer * noise_levels.rfi_oms_noise
         tmi_oms_ffd = tmi_readout_transfer * noise_levels.tmi_oms_noise
         tm_noise_ffd = tm_transfer * noise_levels.tm_noise
-        
+
         rfi_backlink_ffd = rfi_backlink_transfer * noise_levels.rfi_backlink_noise
         tmi_backlink_ffd = tmi_backlink_transfer * noise_levels.tmi_backlink_noise
 
-        total_noise = tm_noise_ffd + isi_oms_ffd + rfi_oms_ffd + tmi_oms_ffd + rfi_backlink_ffd + tmi_backlink_ffd
+        total_noise = (
+            tm_noise_ffd
+            + isi_oms_ffd
+            + rfi_oms_ffd
+            + tmi_oms_ffd
+            + rfi_backlink_ffd
+            + tmi_backlink_ffd
+        )
         return total_noise
 
     @staticmethod
@@ -415,8 +477,7 @@ class X2TDISens(Sensitivity):
             + Sensitivity.stochastic_transform.__doc__.split("PSDs.\n\n")[-1]
         )
         x = 2.0 * np.pi * lisaLT * f
-        # TODO: check these functions for TDI2
-        t = 4.0 * x**2 * np.sin(x) ** 2
+        t = 4.0 * x**2 * np.sin(x) ** 2 * (4.0 * np.sin(2.0 * x) ** 2)
         return Sh * t
 
 
@@ -430,6 +491,7 @@ class Z2TDISens(X2TDISens):
     channel: str = "Z"
     __doc__ = X2TDISens.__doc__
     pass
+
 
 class XY2TDISens(Sensitivity):
     """
@@ -454,14 +516,14 @@ class XY2TDISens(Sensitivity):
     def Cxy(f: float | np.ndarray) -> float | np.ndarray:
         """Common TDI transform factor for CSD.
 
-        `arXiv:2211.02539 <https://arxiv.org/pdf/2211.02539>`_. 
-        
+        `arXiv:2211.02539 <https://arxiv.org/pdf/2211.02539>`_.
+
         Args:
             f: Frequencyies to evaluate.
 
         Returns:
             Cxy: Transform factor.
-        
+
         """
         x = 2 * np.pi * f * L_SI / C_SI
 
@@ -497,16 +559,23 @@ class XY2TDISens(Sensitivity):
         tm_transfer = 4 * Cxy
         rfi_backlink_transfer = Cxy
         tmi_backlink_transfer = Cxy
- 
+
         isi_oms_ffd = isi_rfi_readout_transfer * noise_levels.isi_oms_noise
         rfi_oms_ffd = isi_rfi_readout_transfer * noise_levels.rfi_oms_noise
         tmi_oms_ffd = tmi_readout_transfer * noise_levels.tmi_oms_noise
         tm_noise_ffd = tm_transfer * noise_levels.tm_noise
-        
+
         rfi_backlink_ffd = rfi_backlink_transfer * noise_levels.rfi_backlink_noise
         tmi_backlink_ffd = tmi_backlink_transfer * noise_levels.tmi_backlink_noise
 
-        total_noise = tm_noise_ffd + isi_oms_ffd + rfi_oms_ffd + tmi_oms_ffd + rfi_backlink_ffd + tmi_backlink_ffd
+        total_noise = (
+            tm_noise_ffd
+            + isi_oms_ffd
+            + rfi_oms_ffd
+            + tmi_oms_ffd
+            + rfi_backlink_ffd
+            + tmi_backlink_ffd
+        )
         return total_noise
 
     @staticmethod
@@ -516,8 +585,9 @@ class XY2TDISens(Sensitivity):
         """
         Transform stochastic background to TDI2 XY CSD.
 
-        Note: For now, using same transform as TDI1 (placeholder).
-        TODO: Verify correct stochastic transform for TDI2 CSDs.
+        The TDI-1.5 X transform scaled by the TDI-2 filter
+        :math:`4\\sin^2(2x)` and by :math:`-1/2`, the low-frequency
+        XY/XX ratio for an isotropic background.
 
         Args:
             f: Frequency array [Hz].
@@ -528,8 +598,7 @@ class XY2TDISens(Sensitivity):
             Stochastic contribution to CSD.
         """
         x = 2.0 * np.pi * lisaLT * f
-        # Placeholder - using TDI1 form scaled by -0.5
-        t = -0.5 * (4.0 * x**2 * np.sin(x) ** 2)
+        t = -0.5 * (4.0 * x**2 * np.sin(x) ** 2) * (4.0 * np.sin(2.0 * x) ** 2)
         return Sh * t
 
 
@@ -558,7 +627,10 @@ class ZX2TDISens(XY2TDISens):
     __doc__ = XY2TDISens.__doc__
     pass
 
+
 class A1TDISens(X1TDISens, Sensitivity):
+    """Sensitivity for the TDI 1.5 A channel (orthogonal A/E/T basis)."""
+
     channel: str = "A"
 
     @staticmethod
@@ -573,13 +645,20 @@ class A1TDISens(X1TDISens, Sensitivity):
         )
 
         # these are WRONG
-        if np.any(np.asarray([
-            noise_levels.rfi_backlink_noise,
-            noise_levels.tmi_backlink_noise,
-            noise_levels.rfi_oms_noise,
-            noise_levels.tmi_oms_noise
-        ]) != 0.0):
-            raise NotImplementedError("ExtendedLISAModel has not been implemented yet for A1/E1/T1.")
+        if np.any(
+            np.asarray(
+                [
+                    noise_levels.rfi_backlink_noise,
+                    noise_levels.tmi_backlink_noise,
+                    noise_levels.rfi_oms_noise,
+                    noise_levels.tmi_oms_noise,
+                ]
+            )
+            != 0.0
+        ):
+            raise NotImplementedError(
+                "ExtendedLISAModel has not been implemented yet for A1/E1/T1."
+            )
 
         assert noise_levels.units == "relative_frequency"
         Cxx = X1TDISens.Cxx(f)
@@ -590,22 +669,29 @@ class A1TDISens(X1TDISens, Sensitivity):
         tmi_readout_transfer = Cxx * (2.0 * (1.0 + np.cos(x) ** 2))
         rfi_backlink_transfer = Cxx
         tmi_backlink_transfer = Cxx * (2.0 * (1.0 + np.cos(x) ** 2))
-        
+
         # these are right and were changed accordingly
         # Need to find a citation for these 1st gen stuff
         # all that is needed for old model type
-        isi_rfi_readout_transfer = 1/2 * Cxx * (2.0 + np.cos(x))
+        isi_rfi_readout_transfer = 1 / 2 * Cxx * (2.0 + np.cos(x))
         tm_transfer = Cxx * (3.0 + 2.0 * np.cos(x) + np.cos(2 * x))
 
         isi_oms_ffd = isi_rfi_readout_transfer * noise_levels.isi_oms_noise
         rfi_oms_ffd = isi_rfi_readout_transfer * noise_levels.rfi_oms_noise
         tmi_oms_ffd = tmi_readout_transfer * noise_levels.tmi_oms_noise
         tm_noise_ffd = tm_transfer * noise_levels.tm_noise
-        
+
         rfi_backlink_ffd = rfi_backlink_transfer * noise_levels.rfi_backlink_noise
         tmi_backlink_ffd = tmi_backlink_transfer * noise_levels.tmi_backlink_noise
 
-        total_noise = tm_noise_ffd + isi_oms_ffd + rfi_oms_ffd + tmi_oms_ffd + rfi_backlink_ffd + tmi_backlink_ffd
+        total_noise = (
+            tm_noise_ffd
+            + isi_oms_ffd
+            + rfi_oms_ffd
+            + tmi_oms_ffd
+            + rfi_backlink_ffd
+            + tmi_backlink_ffd
+        )
         return total_noise
 
     @staticmethod
@@ -628,6 +714,8 @@ class E1TDISens(A1TDISens):
 
 
 class T1TDISens(Sensitivity):
+    """Sensitivity for the TDI 1.5 T channel (null channel of A/E/T basis)."""
+
     channel: str = "T"
 
     @staticmethod
@@ -642,40 +730,54 @@ class T1TDISens(Sensitivity):
         )
 
         assert noise_levels.units == "relative_frequency"
-        
+
         Cxx = X1TDISens.Cxx(f)
 
         x = 2 * np.pi * f * L_SI / C_SI
 
         # these are WRONG
-        if np.any(np.asarray([
-            noise_levels.rfi_backlink_noise,
-            noise_levels.tmi_backlink_noise,
-            noise_levels.rfi_oms_noise,
-            noise_levels.tmi_oms_noise
-        ]) != 0.0):
-            raise NotImplementedError("ExtendedLISAModel has not been implemented yet for A1/E1/T1.")
+        if np.any(
+            np.asarray(
+                [
+                    noise_levels.rfi_backlink_noise,
+                    noise_levels.tmi_backlink_noise,
+                    noise_levels.rfi_oms_noise,
+                    noise_levels.tmi_oms_noise,
+                ]
+            )
+            != 0.0
+        ):
+            raise NotImplementedError(
+                "ExtendedLISAModel has not been implemented yet for A1/E1/T1."
+            )
         tmi_readout_transfer = Cxx * (2.0 * (1.0 + np.cos(x) ** 2))
         rfi_backlink_transfer = Cxx
         tmi_backlink_transfer = Cxx * (2.0 * (1.0 + np.cos(x) ** 2))
-        
+
         # these are right and were changed accordingly
         # Need to find a citation for these 1st gen stuff
         # all that is needed for old model type
         isi_rfi_readout_transfer = Cxx * (1 - np.cos(x))
-        tm_transfer = 8.0 * Cxx * np.sin(x / 2.) ** 4
+        tm_transfer = 8.0 * Cxx * np.sin(x / 2.0) ** 4
 
         isi_oms_ffd = isi_rfi_readout_transfer * noise_levels.isi_oms_noise
         rfi_oms_ffd = isi_rfi_readout_transfer * noise_levels.rfi_oms_noise
         tmi_oms_ffd = tmi_readout_transfer * noise_levels.tmi_oms_noise
         tm_noise_ffd = tm_transfer * noise_levels.tm_noise
-        
+
         rfi_backlink_ffd = rfi_backlink_transfer * noise_levels.rfi_backlink_noise
         tmi_backlink_ffd = tmi_backlink_transfer * noise_levels.tmi_backlink_noise
 
-        total_noise = tm_noise_ffd + isi_oms_ffd + rfi_oms_ffd + tmi_oms_ffd + rfi_backlink_ffd + tmi_backlink_ffd
+        total_noise = (
+            tm_noise_ffd
+            + isi_oms_ffd
+            + rfi_oms_ffd
+            + tmi_oms_ffd
+            + rfi_backlink_ffd
+            + tmi_backlink_ffd
+        )
         return total_noise
-    
+
     @staticmethod
     def stochastic_transform(
         f: float | np.ndarray, Sh: float | np.ndarray, **kwargs: dict
@@ -688,9 +790,9 @@ class T1TDISens(Sensitivity):
         t = 4.0 * x**2 * np.sin(x) ** 2
         return 0.0 * (Sh * t)
 
-
-
 class A2TDISens(X2TDISens, Sensitivity):
+    """Sensitivity for the TDI 2.0 A channel."""
+
     channel: str = "A"
 
     @staticmethod
@@ -708,22 +810,30 @@ class A2TDISens(X2TDISens, Sensitivity):
         Cxx = X2TDISens.Cxx(f)
 
         x = 2 * np.pi * f * L_SI / C_SI
-        
-        isi_rfi_readout_transfer = 2. * Cxx * (2 + np.cos(x))
-        tmi_readout_transfer = Cxx * (3 + 2 * np.cos(x) + np.cos(2 * x)) 
-        tm_transfer = 4 * Cxx * (3 + 2 * np.cos(x) + np.cos(2 * x)) 
+
+        isi_rfi_readout_transfer = 2.0 * Cxx * (2 + np.cos(x))
+        tmi_readout_transfer = Cxx * (3 + 2 * np.cos(x) + np.cos(2 * x))
+        tm_transfer = 4 * Cxx * (3 + 2 * np.cos(x) + np.cos(2 * x))
+
         rfi_backlink_transfer = 2 * Cxx * (2 * np.cos(x))
-        tmi_backlink_transfer = Cxx * (3 + 2 * np.cos(x) + np.cos(2 * x)) 
- 
+        tmi_backlink_transfer = Cxx * (3 + 2 * np.cos(x) + np.cos(2 * x))
+
         isi_oms_ffd = isi_rfi_readout_transfer * noise_levels.isi_oms_noise
         rfi_oms_ffd = isi_rfi_readout_transfer * noise_levels.rfi_oms_noise
         tmi_oms_ffd = tmi_readout_transfer * noise_levels.tmi_oms_noise
         tm_noise_ffd = tm_transfer * noise_levels.tm_noise
-        
+
         rfi_backlink_ffd = rfi_backlink_transfer * noise_levels.rfi_backlink_noise
         tmi_backlink_ffd = tmi_backlink_transfer * noise_levels.tmi_backlink_noise
 
-        total_noise = tm_noise_ffd + isi_oms_ffd + rfi_oms_ffd + tmi_oms_ffd + rfi_backlink_ffd + tmi_backlink_ffd
+        total_noise = (
+            tm_noise_ffd
+            + isi_oms_ffd
+            + rfi_oms_ffd
+            + tmi_oms_ffd
+            + rfi_backlink_ffd
+            + tmi_backlink_ffd
+        )
         return total_noise
 
     @staticmethod
@@ -735,9 +845,8 @@ class A2TDISens(X2TDISens, Sensitivity):
             + Sensitivity.stochastic_transform.__doc__.split("PSDs.\n\n")[-1]
         )
         x = 2.0 * np.pi * lisaLT * f
-        # TODO: check these functions for TDI2
-        t = 4.0 * x**2 * np.sin(x) ** 2
-        return Sh * t
+        t = 4.0 * x**2 * np.sin(x) ** 2 * (4.0 * np.sin(2.0 * x) ** 2)
+        return 1.5 * (Sh * t)
 
 
 class E2TDISens(A2TDISens):
@@ -747,6 +856,8 @@ class E2TDISens(A2TDISens):
 
 
 class T2TDISens(X2TDISens, Sensitivity):
+    """Sensitivity for the TDI 2.0 T (null) channel."""
+
     channel: str = "T"
 
     @staticmethod
@@ -764,22 +875,29 @@ class T2TDISens(X2TDISens, Sensitivity):
         Cxx = X2TDISens.Cxx(f)
 
         x = 2 * np.pi * f * L_SI / C_SI
-        
-        isi_rfi_readout_transfer = 4. * Cxx * (1 - np.cos(x))
-        tmi_readout_transfer = 8 * Cxx * np.sin(x / 2.) ** 4
-        tm_transfer = 32 * Cxx * np.sin(x / 2.) ** 4
-        rfi_backlink_transfer = 4. * Cxx * (1 - np.cos(x))
-        tmi_backlink_transfer = 8 * Cxx * np.sin(x / 2.) ** 4
- 
+
+        isi_rfi_readout_transfer = 4.0 * Cxx * (1 - np.cos(x))
+        tmi_readout_transfer = 8 * Cxx * np.sin(x / 2.0) ** 4
+        tm_transfer = 32 * Cxx * np.sin(x / 2.0) ** 4
+        rfi_backlink_transfer = 4.0 * Cxx * (1 - np.cos(x))
+        tmi_backlink_transfer = 8 * Cxx * np.sin(x / 2.0) ** 4
+
         isi_oms_ffd = isi_rfi_readout_transfer * noise_levels.isi_oms_noise
         rfi_oms_ffd = isi_rfi_readout_transfer * noise_levels.rfi_oms_noise
         tmi_oms_ffd = tmi_readout_transfer * noise_levels.tmi_oms_noise
         tm_noise_ffd = tm_transfer * noise_levels.tm_noise
-        
+
         rfi_backlink_ffd = rfi_backlink_transfer * noise_levels.rfi_backlink_noise
         tmi_backlink_ffd = tmi_backlink_transfer * noise_levels.tmi_backlink_noise
 
-        total_noise = tm_noise_ffd + isi_oms_ffd + rfi_oms_ffd + tmi_oms_ffd + rfi_backlink_ffd + tmi_backlink_ffd
+        total_noise = (
+            tm_noise_ffd
+            + isi_oms_ffd
+            + rfi_oms_ffd
+            + tmi_oms_ffd
+            + rfi_backlink_ffd
+            + tmi_backlink_ffd
+        )
         return total_noise
 
     @staticmethod
@@ -791,18 +909,20 @@ class T2TDISens(X2TDISens, Sensitivity):
             + Sensitivity.stochastic_transform.__doc__.split("PSDs.\n\n")[-1]
         )
         x = 2.0 * np.pi * lisaLT * f
-        # TODO: check these functions for TDI2
-        t = 4.0 * x**2 * np.sin(x) ** 2
-        return Sh * t
+        t = 4.0 * x**2 * np.sin(x) ** 2 * (4.0 * np.sin(2.0 * x) ** 2)
+        return 0.0 * (Sh * t)
 
 
 class LISASens(Sensitivity):
+    """Base sensitivity curve for LISA (sky-/polarisation-averaged strain)."""
+
     @classmethod
     def get_Sn(
         cls,
         f: float | np.ndarray,
         model: Optional[lisa_models.LISAModel | str] = lisa_models.sangria,
         average: bool = True,
+        include_instrument: bool = True,
         **kwargs: dict,
     ) -> float | np.ndarray:
         """Compute the base LISA sensitivity function.
@@ -813,35 +933,44 @@ class LISASens(Sensitivity):
             average: Whether to apply averaging factors to sensitivity curve.
                 Antenna response: ``av_resp = np.sqrt(5) if average else 1.0``
                 Projection effect: ``Proj = 2.0 / np.sqrt(3) if average else 1.0``
+            include_instrument: If ``True`` (default), include the instrument
+                noise term. If ``False``, return only the stochastic contribution
+                (``model`` is then unused).
             **kwargs: Keyword arguments to pass to :func:`get_stochastic_contribution`. # TODO: fix
 
         Returns:
             Sensitivity array.
 
         """
-        model = lisa_models.check_lisa_model(model)
-        
-        if not isinstance(model, lisa_models.LISAModel):
-            raise NotImplementedError("This function has not been implemented for ExtendedLISAModel yet.")
+        if include_instrument:
+            model = lisa_models.check_lisa_model(model)
 
-        # get noise values
-        noise_values = model.lisanoises(f, unit="displacement")
+            if not isinstance(model, lisa_models.LISAModel):
+                raise NotImplementedError(
+                    "This function has not been implemented for ExtendedLISAModel yet."
+                )
 
-        Sa_d = noise_values.tm_noise
-        Sop = noise_values.isi_oms_noise
+            # get noise values
+            noise_values = model.lisanoises(f, unit="displacement")
 
-        all_m = np.sqrt(4.0 * Sa_d + Sop)
-        ## Average the antenna response
-        av_resp = np.sqrt(5) if average else 1.0
+            Sa_d = noise_values.tm_noise
+            Sop = noise_values.isi_oms_noise
 
-        ## Projection effect
-        Proj = 2.0 / np.sqrt(3) if average else 1.0
+            all_m = np.sqrt(4.0 * Sa_d + Sop)
+            ## Average the antenna response
+            av_resp = np.sqrt(5) if average else 1.0
 
-        ## Approximative transfer function
-        f0 = 1.0 / (2.0 * lisaLT)
-        a = 0.41
-        T = np.sqrt(1 + (f / (a * f0)) ** 2)
-        sens = (av_resp * Proj * T * all_m / lisaL) ** 2
+            ## Projection effect
+            Proj = 2.0 / np.sqrt(3) if average else 1.0
+
+            ## Approximative transfer function
+            f0 = 1.0 / (2.0 * lisaLT)
+            a = 0.41
+            T = np.sqrt(1 + (f / (a * f0)) ** 2)
+            sens = (av_resp * Proj * T * all_m / lisaL) ** 2
+        else:
+            # stochastic-only: skip the instrument term entirely (no model needed)
+            sens = 0.0
 
         # will add zero if ignored
         sens += cls.get_stochastic_contribution(f, **kwargs)
@@ -860,11 +989,18 @@ class CornishLISASens(LISASens):
     """
 
     @staticmethod
-    def get_Sn(
-        f: float | np.ndarray, average: bool = True, **kwargs: dict
-    ) -> float | np.ndarray:
-        # TODO: documentation here
+    def get_Sn(f: float | np.ndarray, average: bool = True, **kwargs: dict) -> float | np.ndarray:
+        """Cornish (2018) LISA PSD evaluated at ``f`` (Hz).
 
+        Args:
+            f: Frequency array in Hz.
+            average: If ``True``, include the sky-averaging factor ``20/3``.
+            **kwargs: Ignored; kept for interface compatibility.
+
+        Returns:
+            PSD values.
+        """
+        # TODO: documentation here
         sky_averaging_constant = 20.0 / 3.0 if average else 1.0
 
         L = 2.5 * 10**9  # Length of LISA arm
@@ -874,12 +1010,7 @@ class CornishLISASens(LISASens):
         Poms = ((1.5e-11) * (1.5e-11)) * (1 + np.power((2e-3) / f, 4))
 
         # Acceleration Noise
-        Pacc = (
-            (3e-15)
-            * (3e-15)
-            * (1 + (4e-4 / f) * (4e-4 / f))
-            * (1 + np.power(f / (8e-3), 4))
-        )
+        Pacc = (3e-15) * (3e-15) * (1 + (4e-4 / f) * (4e-4 / f)) * (1 + np.power(f / (8e-3), 4))
 
         # constants for Galactic background after 1 year of observation
         alpha = 0.171
@@ -911,9 +1042,18 @@ class FlatPSDFunction(LISASens):
     """White Noise PSD function."""
 
     @classmethod
-    def get_Sn(
-        cls, f: float | np.ndarray, val: float, **kwargs: dict
-    ) -> float | np.ndarray:
+    def get_Sn(cls, f: float | np.ndarray, val: float, **kwargs: dict) -> float | np.ndarray:
+        """Return ``val`` broadcast to the shape of ``f`` (a flat / white PSD).
+
+        Args:
+            f: Frequency array (or scalar).
+            val: The constant PSD value.
+            **kwargs: Ignored; kept for interface compatibility.
+
+        Returns:
+            Either an array of shape ``f.shape`` filled with ``val``, or a
+            Python ``float`` if ``f`` was a scalar.
+        """
         # TODO: documentation here
         xp = cls.get_xp(f)
         out = xp.full_like(f, val)
@@ -922,64 +1062,57 @@ class FlatPSDFunction(LISASens):
         return out
 
 
-class SensitivityMatrix:
-    """Container to hold sensitivity information.
+class SensitivityMatrixBase:
+    """Base Container to hold sensitivity information.
 
     Args:
-        f: Frequency array.
-        sens_mat: Input sensitivity list. The shape of the nested lists should represent the shape of the
-            desired matrix. Each entry in the list must be an array, :class:`Sensitivity`-derived object,
-            or a string corresponding to the :class:`Sensitivity` object.
-        **sens_kwargs: Keyword arguments to pass to :func:`Sensitivity.get_Sn`.
-
+        basis_settings: Frequency array in FD. Time array in TD. Wavelet basis in WDM. Etc.
+        skip_inv_det: Whether to skip the determinant check when updating sensitivities. This is relevant for slicing operations.
     """
 
     def __init__(
         self,
-        f: np.ndarray,
-        sens_mat: (
-            List[List[np.ndarray | Sensitivity]]
-            | List[np.ndarray | Sensitivity]
-            | np.ndarray
-            | Sensitivity
-        ),
-        *sens_args: tuple,
-        sens_kwargs_mat = None,
-        **sens_kwargs: dict,
+        settings: domains.DomainSettingsBase,
+        skip_inv_det: bool = False,
     ) -> None:
-        self.frequency_arr = f
-        self.data_length = len(self.frequency_arr)
-        self.sens_args = sens_args
-        if sens_kwargs_mat is None:
-            self.sens_kwargs = sens_kwargs
-        else:
-            self.sens_kwargs = sens_kwargs_mat
+        self.basis_settings = settings
+        self.data_shape = self.basis_settings.basis_shape_active
 
-        self.sens_mat = sens_mat
+        self.do_inv_det = not skip_inv_det
+        # invC / detC are evaluated lazily on first read; this flag tracks
+        # whether sens_mat has changed since the last computation. Subsequent
+        # in-place updates (``__setitem__``) and arithmetic ops (``__add__`` /
+        # ``__sub__``) flip this back to True so the inverse is recomputed only
+        # when the caller actually needs it.
+        self._inv_det_dirty = False
 
     @property
-    def frequency_arr(self) -> np.ndarray:
-        return self._frequency_arr
+    def basis_settings(self) -> domains.DomainSettingsBase:
+        """Domain settings (frequency / time / TF) the matrix is evaluated on."""
+        return self._basis_settings
 
-    @frequency_arr.setter
-    def frequency_arr(self, frequency_arr: np.ndarray) -> None:
-        assert frequency_arr.dtype == np.float64 or frequency_arr.dtype == float
-        assert frequency_arr.ndim == 1
-        self._frequency_arr = frequency_arr
+    @basis_settings.setter
+    def basis_settings(self, basis_settings: domains.DomainSettingsBase) -> None:
+        """Set the domain settings (must be a :class:`~lisatools.domains.DomainSettingsBase`)."""
+        assert isinstance(basis_settings, domains.DomainSettingsBase)
+        self._basis_settings = basis_settings
 
     def check_update(self):
+        """Raise if the original input was raw arrays (rather than callables) and cannot be re-evaluated."""
         if not self.can_redo:
-            raise ValueError("Cannot update sensitivities because original input was arrays rather than functions.")
+            raise ValueError(
+                "Cannot update sensitivities because original input was arrays rather than functions."
+            )
 
-    def update_frequency_arr(self, frequency_arr: np.ndarray) -> None:
+    def update_basis_settings(self, basis_settings: domains.DomainSettingsBase) -> None:
         """Update class with new frequency array.
 
         Args:
-            frequency_arr: Frequency array.
+            basis_settings: Domain information.
 
         """
         self.check_update()
-        self.frequency_arr = frequency_arr
+        self.basis_settings = basis_settings
         self.sens_mat = self.sens_mat_input
 
     def update_model(self, model: lisa_models.LISAModel | list | np.ndarray) -> None:
@@ -1031,13 +1164,17 @@ class SensitivityMatrix:
         if (isinstance(sens_mat, np.ndarray) or isinstance(
             sens_mat, cp.ndarray)
         ) and sens_mat.dtype != object:
+            assert sens_mat.shape[-len(self.data_shape):] == self.data_shape
+            
             self._sens_mat = sens_mat
             if not hasattr(self, "sens_mat_input"):
                 self.can_redo = False
             else:
                 self.can_redo = True
 
-        elif isinstance(sens_mat, list) or (isinstance(sens_mat, np.ndarray) and sens_mat.dtype == object):
+        elif isinstance(sens_mat, list) or (
+            isinstance(sens_mat, np.ndarray) and sens_mat.dtype == object
+        ):
             self.sens_mat_input = deepcopy(sens_mat)
             _run = True
             _layer = self.sens_mat_input
@@ -1052,7 +1189,7 @@ class SensitivityMatrix:
                     else:
                         if _type_1 != type(tmp):
                             raise ValueError("List inputs must be all of the same type.")
-                        
+
                     if isinstance(tmp, list):
                         if _test_length is None:
                             _test_length = len(tmp)
@@ -1061,7 +1198,9 @@ class SensitivityMatrix:
                                 raise ValueError("Input list structure is not Rectangular.")
                     elif isinstance(tmp, np.ndarray) or isinstance(tmp, cp.ndarray):
                         if tmp.ndim > 1:
-                            raise ValueError("If entering a list of arrays, arrays must be 1D on the last dimension of the list structure.")
+                            raise ValueError(
+                                "If entering a list of arrays, arrays must be 1D on the last dimension of the list structure."
+                            )
                         if _test_length is None:
                             _test_length = len(tmp)
                         else:
@@ -1096,9 +1235,10 @@ class SensitivityMatrix:
                     continue
 
                 else:
-                    raise ValueError("Matrix element must be Sensitivity object, string representing a sensitivity object, or an array with values.")
-                
-        
+                    raise ValueError(
+                        "Matrix element must be Sensitivity object, string representing a sensitivity object, or an array with values."
+                    )
+
             if isinstance(self.sens_kwargs, np.ndarray) or isinstance(self.sens_kwargs, list):
                 tmp_kwargs = np.asarray(self.sens_kwargs, dtype=object)
                 assert tmp_kwargs.shape == tuple(outer_shape)
@@ -1107,23 +1247,24 @@ class SensitivityMatrix:
                 tmp_kwargs = np.full(outer_shape, self.sens_kwargs, dtype=object)
             else:
                 raise ValueError("sens_kwargs Must be numpy object array, list, or dict.")
-            
+
             # TODO: sens_kwargs property setup
             self.sens_kwargs = tmp_kwargs
-            
+
             num_components = np.prod(outer_shape).item()
-            xp = get_array_module(self.frequency_arr)
+            xp = get_array_module(self.basis_settings.f_arr)
+            # xp = np
             if self.is_array_base:
                 _sens_mat = xp.asarray(sens_mat)
-            
+
             else:
                 _flattened_arr = np.asarray(sens_mat, dtype=object).flatten()
-                _sens_mat = xp.zeros((num_components, len(self.frequency_arr)))
+                _sens_mat = xp.zeros((num_components,) + self.basis_settings.basis_shape_active)
                 for i, matrix_member in enumerate(_flattened_arr):
                     # calculate it
                     if hasattr(matrix_member, "get_Sn") or isinstance(matrix_member, str):
                         _sens_mat[i, :] = get_sensitivity(
-                            self.frequency_arr,
+                            self.basis_settings,
                             *self.sens_args,
                             sens_fn=matrix_member,
                             **self.sens_kwargs.flatten()[i],
@@ -1131,49 +1272,226 @@ class SensitivityMatrix:
 
                     else:
                         raise ValueError
-
             # setup in array form
-            self._sens_mat = _sens_mat.reshape(tuple(outer_shape) + (len(self.frequency_arr),))
-            
+            self._sens_mat = _sens_mat.reshape(tuple(outer_shape) + self.basis_settings.basis_shape_active)
+
         else:
             raise ValueError("Must input array or list.")
+
+        self.channel_shape = self._sens_mat.shape[: -len(self.data_shape)]
+
+        # Defer inv/det computation: a subsequent read of ``invC`` / ``detC``
+        # will trigger ``_setup_det_and_inv`` once. This lets a chain like
+        # ``A + B + C`` pay the inverse cost only at the final access, not
+        # after every intermediate operation.
+        self._inv_det_dirty = True
+
+    @property
+    def differential_component(self) -> float:
+        """Pass-through to :attr:`basis_settings.differential_component` (df / dt / etc.)."""
+        return self.basis_settings.differential_component
+
+    # use the getitem to get a slice of the sensitivity matrix, then use that to get the corresponding slice of the determinant and inverse
+    def get_slice(self, index: tuple | slice) -> SensitivityMatrixBase:
+        """
+        Get a time and frequency slice of the sensitivity matrix, and corresponding slices of the determinant and inverse.
+
+        Args:
+            index (tuple | slice): Slice, or tuple of slices, to apply to the sensitivity matrix.
+                                   The slice(s) should select part of the time and frequency dimensions of the sensitivity matrix, which are the last dimensions of the array.
+
+        Returns:
+            A new SensitivityMatrixBase object with the sliced sensitivity matrix, and corresponding sliced determinant and inverse.
+        """
+        new_settings = self.basis_settings.get_slice(index)
+        new_mat = SensitivityMatrixBase(new_settings, skip_inv_det=True)
+
+        # Normalize index to a tuple so that multi-dimensional basis slices
+        # (e.g. (time_slice, freq_slice) for STFT) unpack correctly when
+        # combined with Ellipsis for the channel dimensions.
+        basis_idx = index if isinstance(index, tuple) else (index,)
+
+        new_mat.sens_mat = self.sens_mat[(Ellipsis,) + basis_idx]
+        new_mat.detC = self.detC[basis_idx]
+        new_mat.invC = self.invC[(Ellipsis,) + basis_idx]
+
+        # now set skip_inv_det to False
+        new_mat.do_inv_det = True
+
+        return new_mat
+
+    # def _setup_det_and_inv(self):
+    #     """Determinant and inverse of TDI matrix."""
+
+    #     # setup detC
+    #     xp = get_array_module(self.sens_mat)
+
+    #     # setup detC
+    #     if self.sens_mat.ndim < 3:
+    #         self.detC = xp.prod(self.sens_mat, axis=0)
+    #         self.invC = 1 / self.sens_mat
+
+    #     else:
+    #         full_shape = tuple(range(len(self.sens_mat.shape)))
+
+    #         basis_axes = full_shape[-len(self.data_shape) :]
+    #         mat_axes = full_shape[: -len(self.data_shape)]
+    #         transpose_shape = basis_axes + mat_axes
+    #         self.detC = xp.linalg.det(self.sens_mat.transpose(transpose_shape))
+    #         invC = xp.zeros_like(self.sens_mat.transpose(transpose_shape))
+    #         invC[self.detC != 0.0] = xp.linalg.inv(
+    #             self.sens_mat.transpose(transpose_shape)[self.detC != 0.0]
+    #         )
+    #         invC[self.detC == 0.0] = 1e-100
+
+    #         # switch them after they were effectively switched above
+    #         self.invC = invC.transpose(transpose_shape)
+    def _setup_det_and_inv(self) -> None:
+        """Determinant and inverse of TDI matrix. (Patched version)"""
         
-        self._setup_det_and_inv()
-
-    def _setup_det_and_inv(self):
-        # setup detC
-        """Determinant of TDI matrix."""
-        if self.sens_mat.ndim < 3:
-            self.detC = self.sens_mat
-            self.invC = 1/self.sens_mat
-
-        else:
+        # Check if a custom array module is used (like cupy), fallback to numpy
+        try:
             xp = get_array_module(self.sens_mat)
-            self.detC = xp.linalg.det(self.sens_mat.transpose(2, 0, 1))
-            invC = xp.zeros_like(self.sens_mat.transpose(2, 0, 1))
-            if xp.all(self.detC == 0.0):
-                raise ValueError("All determinants are zero.")
-            
-            invC[self.detC != 0.0] = xp.linalg.inv(self.sens_mat.transpose(2, 0, 1)[self.detC != 0.0])
-            invC[self.detC == 0.0] = 1e-100
-            self.invC = invC.transpose(1, 2, 0)
-            
-        xp = get_array_module(self.sens_mat)
+        except NameError:
+            xp = np
 
         # setup detC
-        """Determinant and inverse of TDI matrix."""
-        if self.sens_mat.ndim < 3:
-            self.detC = xp.prod(self.sens_mat, axis=0)
-            self.invC = 1 / self.sens_mat
+        if len(self.channel_shape) == 1:
+            self._detC = xp.prod(self.sens_mat, axis=0)
+            self._invC = 1 / self.sens_mat
 
+        # TODO switch to Cholesky decomposition and inversion!
         else:
-            self.detC = xp.linalg.det(self.sens_mat.transpose(2, 0, 1))
-            invC = xp.zeros_like(self.sens_mat.transpose(2, 0, 1))
-            invC[self.detC != 0.0] = xp.linalg.inv(
-                self.sens_mat.transpose(2, 0, 1)[self.detC != 0.0]
+            assert len(self.channel_shape) == 2
+            full_shape = tuple(range(len(self.sens_mat.shape)))
+
+            basis_axes = full_shape[-len(self.data_shape):]
+            mat_axes = full_shape[:-len(self.data_shape)]
+            transpose_shape = basis_axes + mat_axes
+            self._detC = xp.linalg.det(self.sens_mat.transpose(transpose_shape))
+
+            tmp = self.sens_mat.transpose(transpose_shape).reshape((-1,) + self.channel_shape)
+
+            _invC = xp.zeros_like(tmp)
+
+            # adjust for nans in off-diagonals
+            for i in range(3):
+                for j in range(3):
+                    if i != j:
+                        tmp[np.isnan(tmp[:, i, j]), i, j] = 0.0
+
+            batch = 100000
+            inds = np.arange(0, tmp.shape[0], batch)
+            if inds[0] < tmp.shape[0]:
+                inds = np.concatenate([inds, np.array([tmp.shape[0]])])
+            inds_bad = []
+            for ind_st, ind_end in zip(inds[:-1], inds[1:]):
+                try:
+                    _invC[ind_st:ind_end] = xp.linalg.inv(tmp[ind_st:ind_end])
+                except np.linalg.LinAlgError:
+                    for i in range(ind_st, ind_end):
+                        try:
+                            _invC[i] = xp.linalg.inv(tmp[i])
+                        except np.linalg.LinAlgError:
+                            _invC[i] = 1e-100
+                            inds_bad.append(i)
+                # print(ind_st)
+
+            inds_bad = np.asarray(inds_bad)
+
+            invC = _invC.reshape(self.data_shape + self.channel_shape)
+
+            # switch them after they were effectively switched above
+
+            full_shape_rev = tuple(range(len(invC.shape)))
+
+            basis_axes_rev = full_shape_rev[:len(self.data_shape)]
+            mat_axes_rev = full_shape_rev[len(self.data_shape):]
+            transpose_shape_rev = mat_axes_rev + basis_axes_rev
+            self._invC = invC.transpose(transpose_shape_rev)
+        self._inv_det_dirty = False
+            
+    @property
+    def invC(self) -> np.ndarray:
+        """Inverse covariance Σ⁻¹.
+
+        Computed lazily: a fresh ``sens_mat`` (from construction, ``__setitem__``,
+        or an arithmetic op) just flips a dirty flag; the actual matrix inverse
+        runs on the first read of ``invC`` (or ``detC``) afterwards. A chain
+        ``A + B + C + …`` therefore pays the inverse cost exactly once, at the
+        final access. ``do_inv_det=False`` (e.g. after slicing) suppresses the
+        auto-recompute and returns whatever was last assigned.
+        """
+        if self._inv_det_dirty and self.do_inv_det:
+            self._setup_det_and_inv()
+        return self._invC
+
+    @invC.setter
+    def invC(self, value: np.ndarray) -> None:
+        # Explicit assignment wins: clear the dirty flag so subsequent reads
+        # return the just-assigned value rather than recomputing over it.
+        self._invC = value
+        self._inv_det_dirty = False
+
+    @property
+    def detC(self) -> np.ndarray:
+        """Determinant det[Σ]. Lazily computed; see :attr:`invC` for semantics."""
+        if self._inv_det_dirty and self.do_inv_det:
+            self._setup_det_and_inv()
+        return self._detC
+
+    @detC.setter
+    def detC(self, value: np.ndarray) -> None:
+        self._detC = value
+        self._inv_det_dirty = False
+
+    def compute_inv_det(self) -> None:
+        """Force-compute ``invC`` / ``detC`` now (rather than waiting for first read)."""
+        self.do_inv_det = True
+        if self._inv_det_dirty:
+            self._setup_det_and_inv()
+
+    def _combine(
+        self,
+        other: "SensitivityMatrixBase | np.ndarray | float",
+        op: Callable,
+    ) -> "SensitivityMatrixBase":
+        """Combine ``self.sens_mat`` with ``other`` via ``op`` and return a new instance.
+
+        The returned matrix shares ``basis_settings`` with ``self`` and starts
+        out *dirty* — ``invC`` / ``detC`` are not computed until first read.
+        """
+        if isinstance(other, SensitivityMatrixBase):
+            other_arr = other.sens_mat
+        elif isinstance(other, (np.ndarray, cp.ndarray)):
+            other_arr = other
+        else:
+            return NotImplemented
+
+        if other_arr.shape != self.sens_mat.shape:
+            raise ValueError(
+                f"Shape mismatch combining SensitivityMatrixBase: "
+                f"self.sens_mat.shape={self.sens_mat.shape} vs "
+                f"other.shape={other_arr.shape}."
             )
-            invC[self.detC == 0.0] = 1e-100
-            self.invC = invC.transpose(1, 2, 0)
+
+        new = SensitivityMatrixBase(self.basis_settings)
+        new.sens_mat = op(self.sens_mat, other_arr)
+        return new
+
+    def __add__(self, other):
+        return self._combine(other, operator.add)
+
+    def __sub__(self, other):
+        return self._combine(other, operator.sub)
+
+    def add(self, other) -> "SensitivityMatrixBase":
+        """Object-oriented equivalent of ``self + other``. Returns a new matrix."""
+        return self._combine(other, operator.add)
+
+    def subtract(self, other) -> "SensitivityMatrixBase":
+        """Object-oriented equivalent of ``self - other``. Returns a new matrix."""
+        return self._combine(other, operator.sub)
 
     def __getitem__(self, index: Any) -> np.ndarray:
         """Indexing the class indexes the array."""
@@ -1182,7 +1500,7 @@ class SensitivityMatrix:
     def __setitem__(self, index: Any, value: np.ndarray) -> np.ndarray:
         """Indexing the class indexes the array."""
         self.sens_mat[index] = value
-        self._setup_det_and_inv()
+        self._inv_det_dirty = True
 
     @property
     def ndim(self) -> int:
@@ -1225,6 +1543,8 @@ class SensitivityMatrix:
         if (ax is None and fig is None) or (
             ax is not None and (isinstance(ax, list) or isinstance(ax, np.ndarray))
         ):
+            if not isinstance(self.basis_settings, domains.FDSettings):
+                raise NotImplementedError("Needs to be frequency domain for automatic plotting.")
             if ax is None and fig is None:
                 outer_shape = self.shape[:-1]
                 if len(outer_shape) == 2:
@@ -1246,8 +1566,8 @@ class SensitivityMatrix:
             for i in range(np.prod(self.shape[:-1])):
                 plot_in = self.flatten()[i]
                 if char_strain:
-                    plot_in = np.sqrt(self.frequency_arr * plot_in)
-                ax[i].loglog(self.frequency_arr, plot_in, **kwargs)
+                    plot_in = np.sqrt(self.basis_settings.f_arr * plot_in)
+                ax[i].loglog(self.basis_settings.f_arr, plot_in, **kwargs)
 
         elif fig is not None:
             raise NotImplementedError
@@ -1259,15 +1579,48 @@ class SensitivityMatrix:
                 )
             plot_in = self.sens_mat[inds]
             if char_strain:
-                plot_in = np.sqrt(self.frequency_arr * plot_in)
-            ax.loglog(self.frequency_arr, plot_in, **kwargs)
+                plot_in = np.sqrt(self.basis_settings.f_arr * plot_in)
+            ax.loglog(self.basis_settings.f_arr, plot_in, **kwargs)
 
         else:
-            raise ValueError(
-                "ax must be a list of axes objects or a single axes object."
-            )
+            raise ValueError("ax must be a list of axes objects or a single axes object.")
 
         return (fig, ax)
+
+
+class SensitivityMatrix(SensitivityMatrixBase):
+    """Container to hold sensitivity information.
+
+    Args:
+        basis_x: Frequency array in FD. Time array in TD. Wavelet basis in WDM. Etc.
+        sens_mat: Input sensitivity list. The shape of the nested lists should represent the shape of the
+            desired matrix. Each entry in the list must be an array, :class:`Sensitivity`-derived object,
+            or a string corresponding to the :class:`Sensitivity` object.
+        **sens_kwargs: Keyword arguments to pass to :func:`Sensitivity.get_Sn`.
+
+    """
+
+    def __init__(
+        self,
+        settings: domains.DomainSettingsBase,
+        sens_mat: (
+            List[List[np.ndarray | Sensitivity]]
+            | List[np.ndarray | Sensitivity]
+            | np.ndarray
+            | Sensitivity
+        ),
+        *sens_args: tuple,
+        sens_kwargs_mat=None,
+        **sens_kwargs: dict,
+    ) -> None:
+        super().__init__(settings)
+        self.sens_args = sens_args
+        if sens_kwargs_mat is None:
+            self.sens_kwargs = sens_kwargs
+        else:
+            self.sens_kwargs = sens_kwargs_mat
+
+        self.sens_mat = sens_mat
 
 
 class XYZ1SensitivityMatrix(SensitivityMatrix):
@@ -1281,13 +1634,14 @@ class XYZ1SensitivityMatrix(SensitivityMatrix):
 
     """
 
-    def __init__(self, f: np.ndarray, **sens_kwargs: dict) -> None:
+    def __init__(self, settings: domains.DomainSettingsBase, **sens_kwargs: dict) -> None:
         sens_mat = [
             [X1TDISens, XY1TDISens, ZX1TDISens],
             [XY1TDISens, Y1TDISens, YZ1TDISens],
             [ZX1TDISens, YZ1TDISens, Z1TDISens],
         ]
-        super().__init__(f, sens_mat, **sens_kwargs)
+        super().__init__(settings, sens_mat, **sens_kwargs)
+
 
 class XYZ2SensitivityMatrix(SensitivityMatrix):
     """
@@ -1312,12 +1666,12 @@ class XYZ2SensitivityMatrix(SensitivityMatrix):
         - The detC attribute provides det[Σ(f)] for normalization
     """
 
-    def __init__(self, f: np.ndarray, **sens_kwargs: dict) -> None:
+    def __init__(self, settings: domains.DomainSettingsBase, **sens_kwargs: dict) -> None:
         """
         Initialize TDI2 sensitivity matrix.
 
         Args:
-            f: Frequency array [Hz].
+            settings: Domain settings containing frequency array and other parameters.
             **sens_kwargs: Keyword arguments for Sensitivity.get_Sn()
                 Common kwargs:
                     - model: LISA noise model (e.g., sangria, sangria)
@@ -1325,15 +1679,16 @@ class XYZ2SensitivityMatrix(SensitivityMatrix):
                     - stochastic_function: Custom stochastic function
         """
         # Define 3×3 matrix structure
-        # Diagonal: X2, Y2, Z2 PSDs 
-        # Off-diagonal: XY2, YZ2, ZX2 CSDs 
+        # Diagonal: X2, Y2, Z2 PSDs
+        # Off-diagonal: XY2, YZ2, ZX2 CSDs
         sens_mat = [
-            [X2TDISens,   XY2TDISens,  ZX2TDISens],
-            [XY2TDISens,  Y2TDISens,   YZ2TDISens],
-            [ZX2TDISens,  YZ2TDISens,  Z2TDISens],
+            [X2TDISens, XY2TDISens, ZX2TDISens],
+            [XY2TDISens, Y2TDISens, YZ2TDISens],
+            [ZX2TDISens, YZ2TDISens, Z2TDISens],
         ]
 
-        super().__init__(f, sens_mat, **sens_kwargs)
+        super().__init__(settings, sens_mat, **sens_kwargs)
+
 
 class AET1SensitivityMatrix(SensitivityMatrix):
     """Default sensitivity matrix for AET (TDI 1)
@@ -1346,10 +1701,9 @@ class AET1SensitivityMatrix(SensitivityMatrix):
 
     """
 
-    def __init__(self, f: np.ndarray, **sens_kwargs: dict) -> None:
+    def __init__(self, settings: domains.DomainSettingsBase, **sens_kwargs: dict) -> None:
         sens_mat = [A1TDISens, E1TDISens, T1TDISens]
-        super().__init__(f, sens_mat, **sens_kwargs)
-
+        super().__init__(settings, sens_mat, **sens_kwargs)
 
 
 class AET2SensitivityMatrix(SensitivityMatrix):
@@ -1363,9 +1717,9 @@ class AET2SensitivityMatrix(SensitivityMatrix):
 
     """
 
-    def __init__(self, f: np.ndarray, **sens_kwargs: dict) -> None:
+    def __init__(self, settings: domains.DomainSettingsBase, **sens_kwargs: dict) -> None:
         sens_mat = [A2TDISens, E2TDISens, T2TDISens]
-        super().__init__(f, sens_mat, **sens_kwargs)
+        super().__init__(settings, sens_mat, **sens_kwargs)
 
 
 class AE1SensitivityMatrix(SensitivityMatrix):
@@ -1377,9 +1731,9 @@ class AE1SensitivityMatrix(SensitivityMatrix):
 
     """
 
-    def __init__(self, f: np.ndarray, **sens_kwargs: dict) -> None:
+    def __init__(self, settings: domains.DomainSettingsBase, **sens_kwargs: dict) -> None:
         sens_mat = [A1TDISens, E1TDISens]
-        super().__init__(f, sens_mat, **sens_kwargs)
+        super().__init__(settings, sens_mat, **sens_kwargs)
 
 
 class AE2SensitivityMatrix(SensitivityMatrix):
@@ -1391,9 +1745,9 @@ class AE2SensitivityMatrix(SensitivityMatrix):
 
     """
 
-    def __init__(self, f: np.ndarray, **sens_kwargs: dict) -> None:
+    def __init__(self, settings: domains.DomainSettingsBase, **sens_kwargs: dict) -> None:
         sens_mat = [A2TDISens, E2TDISens]
-        super().__init__(f, sens_mat, **sens_kwargs)
+        super().__init__(settings, sens_mat, **sens_kwargs)
 
 
 class LISASensSensitivityMatrix(SensitivityMatrix):
@@ -1406,17 +1760,26 @@ class LISASensSensitivityMatrix(SensitivityMatrix):
 
     """
 
-    def __init__(self, f: np.ndarray, nchannels: int, **sens_kwargs: dict) -> None:
+    def __init__(
+        self, settings: domains.DomainSettingsBase, nchannels: int, **sens_kwargs: dict
+    ) -> None:
         sens_mat = [LISASens for _ in range(nchannels)]
-        super().__init__(f, sens_mat, **sens_kwargs)
+        super().__init__(settings, sens_mat, **sens_kwargs)
 
+def randc(shape):
+    """Return complex Gaussian noise with the given ``shape`` (real + imaginary unit-variance)."""
+    return np.random.randn(*shape) + 1j*np.random.randn(*shape)
 
 def get_sensitivity(
-    f: float | np.ndarray,
+    basis_settings: domains.DomainSettingsBase,
     *args: tuple,
     sens_fn: Optional[Sensitivity | str] = LISASens,
     return_type="PSD",
-    fill_nans: float = 1e10,
+    fill_nans: float = np.nan,
+    args_list: Optional[List[tuple]] = None,
+    kwargs_list: Optional[List[dict]] = None,
+    wdm_psd_method: str = "fold",
+    stationary: bool = True,
     **kwargs,
 ) -> float | np.ndarray:
     """Generic sensitivity generator
@@ -1431,6 +1794,22 @@ def get_sensitivity(
             PSD, or char_strain (characteristic strain). Default is ASD.
         fill_nans: Value to fill nans in sensitivity (at 0 frequency).
             If ``None``, thens nans will be left in the array.
+        wdm_psd_method: How to build the WDM (wavelet) noise PSD (ignored for
+            non-WDM domains). ``"fold"`` (default) folds the full-resolution
+            Fourier-domain PSD into the wavelet basis (matches the forward WDM
+            transform; ``E[w_mn^2] == S_wdm[m]``). ``"layer_constant"`` is the
+            faster approximation that treats the PSD as constant across a
+            wavelet layer, ``S_wdm[m] = (1/2) Sn(f_layer_center)``.
+        stationary: For WDM, whether the noise PSD is the same for every time
+            pixel. When ``True`` (default) the Fourier-domain PSD is evaluated
+            once and broadcast across all time pixels. When ``False``
+            (time-varying noise) the stationary ``wdm_psd_method`` calculation is
+            repeated per wavelet time column, each using its own Fourier-domain
+            PSD supplied through ``args_list`` / ``kwargs_list`` (length ``Nt``).
+        include_instrument: Forwarded to ``get_Sn`` (in ``kwargs``). ``True``
+            (default) returns instrument + stochastic; ``False`` returns only the
+            stochastic contribution (``model`` then unused) — folded through the
+            same domain dispatch, so it works in FD, WDM, etc.
         **kwargs: Keyword arguments to pass to sensitivity function ``get_Sn`` method.
 
     Return:
@@ -1449,7 +1828,124 @@ def get_sensitivity(
             "sens_fn must be a string for a stock option or a class with a get_Sn method."
         )
 
-    PSD = sensitivity.get_Sn(f, *args, **kwargs)
+    # Back-compat: callers from ``gbgpu`` (and other downstreams that pre-date
+    # the DomainSettings-first signature) pass a raw frequency scalar/array
+    # here. Dispatch straight to ``sensitivity.get_Sn`` on those inputs so
+    # neighbouring packages don't break on the new contract.
+    if not isinstance(basis_settings, domains.DomainSettingsBase):
+        PSD = sensitivity.get_Sn(basis_settings, *args, **kwargs)
+        if fill_nans is not None:
+            PSD = np.nan_to_num(PSD, nan=fill_nans)
+        if return_type == "PSD":
+            return PSD
+        if return_type == "ASD":
+            return np.sqrt(PSD)
+        if return_type == "char_strain":
+            return np.sqrt(np.asarray(basis_settings) * PSD)
+        raise ValueError(f"return_type {return_type!r} not supported.")
+
+    if isinstance(basis_settings, domains.FDSettings):
+        PSD = sensitivity.get_Sn(basis_settings.f_arr, *args, **kwargs)
+
+    elif isinstance(basis_settings, domains.TDSettings):
+        raise NotImplementedError
+    elif isinstance(basis_settings, domains.STFTSettings):
+        raise NotImplementedError
+        PSD = sensitivity.get_Sn(basis_settings.f_arr, *args, **kwargs)
+    elif isinstance(basis_settings, domains.WDMSettings):
+        if kwargs_list is None:
+            kwargs_list = [kwargs for _ in range(basis_settings.Nt)]
+        else:
+            assert isinstance(kwargs_list, list)
+            assert len(kwargs_list) == basis_settings.Nt
+            for tmp in kwargs_list:
+                if not isinstance(tmp, dict):
+                    raise ValueError(
+                        "Value in kwargs_list is not a dictionary. Must be a dictionary."
+                    )
+
+        if args_list is None:
+            args_list = [args for _ in range(basis_settings.Nt)]
+        else:
+            assert isinstance(args_list, list)
+            assert len(args_list) == basis_settings.Nt
+            for tmp in args_list:
+                if not isinstance(tmp, tuple) and not isinstance(tmp, list):
+                    raise ValueError("Value in args_list is not a tuple. Must be a tuple.")
+            
+        xp = get_array_module(basis_settings.f_arr)
+        # equation for stationary noise (https://arxiv.org/pdf/2009.00043; eq. 19)
+        # npts = 3
+        # x = np.linspace(basis_settings.f_arr_edges[:-1],  basis_settings.f_arr_edges[1:], num=npts, axis=-1)
+        # integrand = xp.asarray([sensitivity.get_Sn(x, *_args, **_kwargs) for _args, _kwargs in zip(args_list, kwargs_list)]).transpose(1, 0, 2)
+
+        # # this is to match tyson's code. I have questions
+        # h = 1.0
+        # f0 = integrand[:, :, 0]
+        # f1 = integrand[:, :, 1]
+        # f2 = integrand[:, :, 2]
+        # PSD = simpson_3_integral = h*(f0 + 4.0*f1 + f2)/6.0
+        # 0.25 is fudge factor from tysons code
+        # f_c = np.fft.rfftfreq(basis_settings.N, basis_settings.data_dt)
+        # psd = sensitivity.get_Sn(f_c, *args_list[0], **kwargs_list[0])
+
+        # psd_fd = domains.FDSignal(psd, settings=domains.FDSettings(f_c.shape[0], f_c[1] - f_c[0]))
+        # PSD = psd_fd.wdmtransform(settings=basis_settings, is_psd=True)[0]
+
+        if wdm_psd_method not in ("fold", "layer_constant"):
+            raise ValueError(
+                f"wdm_psd_method must be 'fold' or 'layer_constant', got {wdm_psd_method!r}."
+            )
+
+        def _wdm_layer_psd(_args, _kwargs):
+            """Per-layer wavelet PSD column (length ``Nf_active``) for a single
+            Fourier-domain noise spectrum. For locally stationary noise the
+            folded PSD is independent of the wavelet time pixel, so one column
+            fully describes it; the non-stationary path calls this once per
+            time column with that column's own spectrum."""
+            if wdm_psd_method == "layer_constant":
+                # approximation: PSD constant across each wavelet layer,
+                # evaluated at the layer centre frequencies.
+                f_c = basis_settings.f_arr
+                return 1 / 2 * sensitivity.get_Sn(f_c, *_args, **_kwargs)
+
+            # exact: fold the full-resolution Fourier-domain PSD into the
+            # wavelet basis. Validated so that E[w_mn^2] == S_wdm[m] against the
+            # forward WDM transform (see wdm_noise_validation.py). The fold is
+            # time-column independent, so we keep a single representative column.
+            f_full = xp.fft.rfftfreq(basis_settings.N, basis_settings.data_dt)
+            df = float(f_full[1] - f_full[0])
+            psd_full = sensitivity.get_Sn(f_full, *_args, **_kwargs)
+            psd_fd = domains.FDSignal(
+                psd_full,
+                domains.FDSettings(
+                    f_full.shape[0], df, force_backend=basis_settings.backend
+                ),
+            )
+            folded = xp.real(psd_fd.wdmtransform(settings=basis_settings, is_psd=True)[0])
+            return folded[:, 0]
+
+        if stationary:
+            # STATIONARY: evaluate the Fourier-domain PSD once and broadcast the
+            # single folded layer column across every wavelet time pixel.
+            col = _wdm_layer_psd(args_list[0], kwargs_list[0])
+            PSD = xp.repeat(col[:, None], basis_settings.Nt_active, axis=-1)
+
+        else:
+            # NON-STATIONARY (time-varying): repeat the stationary fold /
+            # layer_constant calculation per wavelet time column, each with its
+            # own Fourier-domain PSD supplied through args_list / kwargs_list
+            # (both length Nt). active_slice_t selects the active columns.
+            cols = [
+                _wdm_layer_psd(args_list[g], kwargs_list[g])
+                for g in range(basis_settings.ind_min_t, basis_settings.ind_max_t + 1)
+            ]
+            PSD = xp.stack(cols, axis=-1)
+
+    else:
+        raise ValueError(
+            f"Domain type entered ({type(basis_settings)}). Needs to be one of {domains.get_available_domains()}"
+        )
 
     if fill_nans is not None:
         assert isinstance(fill_nans, float)
@@ -1462,7 +1958,7 @@ def get_sensitivity(
         return PSD ** (1 / 2)
 
     elif return_type == "char_strain":
-        return (f * PSD) ** (1 / 2)
+        return (basis_settings.f_arr * PSD) ** (1 / 2)
 
     else:
         raise ValueError("return_type must be PSD, ASD, or char_strain.")
@@ -1482,7 +1978,7 @@ __stock_sens_options__ = [
     "Y2TDISens",
     "Z2TDISens",
     "XY2TDISens",
-    "YZ2TDISens",   
+    "YZ2TDISens",
     "ZX2TDISens",
     "LISASens",
     "CornishLISASens",
@@ -1552,3 +2048,1686 @@ def check_sensitivity(sensitivity: Any) -> Sensitivity:
         raise ValueError("sensitivity argument not given correctly.")
 
     return sensitivity
+
+
+# Number of epochs the FD transfer-function average is decimated to, spanning the
+# full orbit. The constellation breathing is smooth on day-to-month scales (dominant
+# period ~1 yr), so ~daily resolution (1024 pts over a ~2 yr orbit) reproduces the
+# average over the full native LTT grid (~25M pts) to well below 0.1% -- while the
+# full grid is infeasible to evaluate the transfer functions on.
+_N_AVERAGE_EPOCHS = 1024
+
+
+class XYZSensitivityBackend(LISAToolsParallelModule, SensitivityMatrixBase):
+    """3x3 XYZ TDI sensitivity matrix backed by the C++/CUDA detector kernels.
+
+    Wraps :class:`LISAToolsParallelModule` (for backend dispatch) and
+    :class:`SensitivityMatrixBase` (for the matrix interface). The matrix is
+    computed at the basis frequencies via the native ``SensitivityMatrixWrap``
+    using averaged light-travel-times derived from the supplied orbits, with
+    optional spline interpolation and galactic-foreground contributions.
+    Currently supports TDI generations 1 and 2, but only XYZ channels.
+
+    Args:
+        orbits: Configured :class:`~lisatools.detector.L1Orbits` instance providing
+            light travel times and spacecraft positions.
+        settings: Domain settings (frequency or time-frequency) the matrix is
+            evaluated on.
+        tdi_generation: 1 for TDI 1.5 or 2 for TDI 2.0.
+        use_splines: If ``True``, use Akima spline interpolation for the noise
+            knots passed in :meth:`set_sensitivity_matrix`.
+        spline_order: Order of the Akima interpolant (passed through to
+            :class:`cudakima.AkimaInterpolant1D`).
+        force_backend: Backend selector (``"cpu"`` or a CUDA name); see
+            :class:`LISAToolsParallelModule`.
+        mask_percentage: Fractional bandwidth around transfer-function dips that
+            is masked out (defaults to ``0.05``).
+        galactic_grid_kwargs: Optional dictionary of keyword arguments to set up
+            the galactic grid for foreground contributions. If ``None`` or empty,
+            the galactic grid is not included in the sensitivity matrix;
+            otherwise the dictionary is passed to :meth:`_setup_galactic_grid`.
+        window_values: Optional window applied to the time-domain data; used for
+            normalising the resulting PSD (accounts for windowing-induced loss
+            of power).
+        average_transfer_functions: Whether to average the TDI transfer functions
+            over the orbit (``True``) or use the values at a single average epoch
+            (``False``), in the case of a frequency-domain basis. Default is
+            ``False``.
+    """
+
+    def __init__(
+        self,
+        orbits: Orbits | L1Orbits,
+        settings: DomainSettingsBase,
+        tdi_generation: int = 2,
+        use_splines: bool = False,
+        spline_order: Optional[str] = "cubic",
+        force_backend: Optional[str] = "cpu",
+        mask_percentage: Optional[float] = None,
+        galactic_grid_kwargs: Optional[dict] = None,
+        window_values: Optional[NDArrayLike] = None,
+        average_transfer_functions: bool = False,
+    ):
+        LISAToolsParallelModule.__init__(self, force_backend=force_backend)
+        SensitivityMatrixBase.__init__(self, settings)
+
+        assert self.backend.xp == orbits.xp, "Orbits and Sensitivity backend mismatch."
+
+        self.orbits = orbits
+        if not self.orbits.configured:
+            self.orbits.configure(linear_interp_setup=True)
+
+        self.tdi_generation = tdi_generation
+        self.channel_shape = (3, 3)
+
+        _use_gpu = force_backend != "cpu"
+
+        self.use_splines = use_splines
+        self.spline_order = spline_order
+        self.spline_interpolant = AkimaInterpolant1D(
+            use_gpu=_use_gpu, threadsperblock=NUM_SPLINE_THREADS, order=spline_order
+        )
+
+        self.mask_percentage = mask_percentage if mask_percentage is not None else 0.05
+
+        self.window_values = window_values
+
+        self.average_transfer_functions = average_transfer_functions
+        self._averaging_active = False   # set True by get_averaged_ltts() in FD averaged mode
+
+        self._setup()
+        
+        self.galactic_grid_kwargs = galactic_grid_kwargs # for propagation to copies
+        include_galaxy = (isinstance(galactic_grid_kwargs, dict) and len(galactic_grid_kwargs) > 0)
+        
+        if include_galaxy:
+            self._sanitize_galactic_grid_kwargs(galactic_grid_kwargs)
+            self._setup_galactic_grid(**galactic_grid_kwargs)
+
+    @property
+    def kwargs(self):
+        return {
+            "orbits": self.orbits,
+            "settings": self.basis_settings,
+            "tdi_generation": self.tdi_generation,
+            "use_splines": self.use_splines,
+            "spline_order": self.spline_order,
+            "force_backend": self.backend.backend_name.split("_")[-1],
+            "mask_percentage": self.mask_percentage,
+            "galactic_grid_kwargs": self.galactic_grid_kwargs,  # propagate to copies
+            "window_values": self.window_values,
+            "average_transfer_functions": self.average_transfer_functions,
+        }
+
+    @property
+    def xp(self):
+        """Array module."""
+        return self.backend.xp
+
+    @property
+    def smoothing_sigma(self):
+        """Sigma for smoothing the sensitivity matrix around the zero dips."""
+        return 5
+
+    @property
+    def time_indices(self):
+        """Integer indices into the time axis used by the C++ backend."""
+        return self._time_indices
+    
+
+    @time_indices.setter
+    def time_indices(self, x):
+        """Set the time-index array used by the C++ backend."""
+        self._time_indices = x
+
+    def get_averaged_ltts(self) -> tuple[np.ndarray, np.ndarray]:
+        """Compute averaged and differential light-travel times across LISA links.
+
+        Reads orbital light-travel times at the segment centre times (STFT/WDM) or
+        at the appropriate FD epoch(s), then forms per-arm averages and differences
+        needed by the C++ sensitivity kernel.
+
+        Link ordering follows ``orbits.LINKS``: [12, 23, 31, 13, 32, 21].
+        Averages are taken between opposite-direction pairs (12↔21, 23↔32, 31↔13).
+
+        Returns:
+            avg_ltts: Mean light-travel times per arm. Shape ``(n_epochs, 6)``.
+            delta_ltts: Signed difference (forward − backward) per arm. Shape ``(n_epochs, 6)``.
+
+        Note:
+            ``n_epochs`` (the first axis of the returned arrays — it becomes the C++
+            wrap's ``n_times`` in :meth:`_setup`) is **not** always equal to
+            ``len(self.time_indices)``:
+
+            * STFT/WDM and FD non-averaging: ``n_epochs == len(self.time_indices)``
+              (one per segment, or 1 for FD).
+            * **FD averaging mode** (``average_transfer_functions=True``): the returned
+              arrays hold ``N ≈ _N_AVERAGE_EPOCHS`` decimated orbit epochs while
+              ``self.time_indices == [0]``. This mismatch is deliberate. Those N epochs
+              exist **only** to feed the one-time transfer-function average in
+              :meth:`_build_and_attach_averaged_tfs` (which evaluates the 12 TFs at all
+              N epochs via ``get_noise_tfs_wrap`` and means them). The likelihood and
+              :meth:`compute_sensitivity_matrix` instead read the precomputed averaged
+              TFs — ``get_noise_covariance`` indexes ``*_avg[f_idx]`` and ignores
+              ``time_index`` — so they iterate a SINGLE effective time. Once the average
+              is built, the wrap's N-epoch LTT array is no longer read in averaged mode.
+        """
+        # first, compute the average ltts and their differences.
+        # check if we need multiple time points
+        if hasattr(self.basis_settings, "t_arr"):
+            t_arr = self.xp.asarray(self.basis_settings.t_arr)
+        
+            tiled_times = self.xp.tile(
+                t_arr[:, self.xp.newaxis], (1, 6)
+            ).flatten()  # compute ltts at these times with orbits
+
+            links = self.xp.tile(self.xp.asarray(self.orbits.LINKS), (t_arr.shape[0],))
+
+            ltts = self.orbits.get_light_travel_times(tiled_times, links).reshape(len(t_arr), 6)
+
+            self.time_indices = self.xp.arange(len(t_arr), dtype=self.xp.int32)
+
+
+        else:
+            if self.average_transfer_functions:
+                # Average the transfer functions over the FULL orbit span. orbits.ltt_t is
+                # the native LTT time grid (fine cadence, ~25M pts); the breathing is smooth
+                # on day-to-month scales, so we decimate to ~daily resolution -> numerically
+                # identical to the full-grid average but tractable. No user-provided
+                # epoch count needed.
+                t_full = self.xp.asarray(self.orbits.ltt_t)
+                stride = max(1, int(len(t_full) // _N_AVERAGE_EPOCHS))
+                t_arr = t_full[::stride]
+                tiled_times = self.xp.tile(t_arr[:, self.xp.newaxis], (1, 6)).flatten()
+                links = self.xp.tile(self.xp.asarray(self.orbits.LINKS), (t_arr.shape[0],))
+                ltts = self.orbits.get_light_travel_times(tiled_times, links).reshape(len(t_arr), 6)
+                # NOTE: ltts holds N decimated epochs -> the wrap is built with n_times=N
+                # (see _setup), but time_indices=[0]. The N epochs feed the one-time TF
+                # average only (_build_and_attach_averaged_tfs); the likelihood reads the
+                # averaged TFs and iterates a single effective time. See the
+                # get_averaged_ltts docstring for the full rationale.
+                self.time_indices = self.xp.array([0], dtype=self.xp.int32)
+                self._averaging_active = True
+            else:
+                # single effective epoch: the orbit-averaged LTTs, i.e. C(E[L])
+                ltts = self.xp.mean(self.orbits.ltt, axis=0)[self.xp.newaxis, :]
+                self.time_indices = self.xp.array([0], dtype=self.xp.int32)
+
+        # with orbits.LINKS order: 12, 23, 31, 13, 32, 21, we need averages between pairs
+        # pairs: (12,21), (23,32), (31,13)
+        # Use direct indexing to avoid assignment issues with shape (1, 6) arrays
+        indices = [0, 1, 2, 3, 4, 5]
+        opposite_indices = indices[::-1]
+
+        avg_ltts = 0.5 * (ltts[:, indices] + ltts[:, opposite_indices])
+        delta_ltts = ltts[:, indices] - ltts[:, opposite_indices]
+
+        return avg_ltts, delta_ltts
+
+    def _setup(self):
+        """Setup the arguments for the c++ backend."""
+
+        avg_ltts, delta_ltts = self.get_averaged_ltts()
+
+        self._setup_window()
+
+        self.pycppsensmat_args = [
+            self.xp.asarray(avg_ltts.flatten().copy()),
+            self.xp.asarray(delta_ltts.flatten().copy()),
+            avg_ltts.shape[0],  # n_times (= N decimated epochs in FD averaged mode; != len(time_indices) there)
+            self.orbits.armlength,
+            self.tdi_generation,
+            self.use_splines,
+            self.window_normalization,
+        ]
+
+        # XYZBackend disabled (symbol issues on Linux): SensitivityMatrixWrap may be absent.
+        _SensitivityMatrixWrap = getattr(self.backend, "SensitivityMatrixWrap", None)
+        if _SensitivityMatrixWrap is None:
+            self.pycpp_sensitivity_matrix = None
+        else:
+            self.pycpp_sensitivity_matrix = _SensitivityMatrixWrap(*self.pycppsensmat_args)
+
+        self._init_basis_settings()
+
+        if self._averaging_active:
+            self._build_and_attach_averaged_tfs()
+
+    def _build_and_attach_averaged_tfs(self):
+        """Precompute epoch-averaged transfer functions and attach them to the
+        c++ object so the in-kernel covariance assembly (and the diagnostic path)
+        use E_t[C(f;L(t))].  Parameter-free -> computed once; arrays kept alive on
+        self and shared across walker copies (like gal_R_avg)."""
+        xp = self.xp
+        nf = self.num_freqs
+        # the epochs to average the transfer functions over (NOT likelihood time
+        # points; the likelihood uses time_indices=[0]). See get_averaged_ltts docstring.
+        N = self.pycppsensmat_args[2]
+        f_arr = xp.asarray(self.f_arr)
+
+        # order MUST match get_noise_tfs_wrap: oms_xx,xy,xz,yy,yz,zz, tm_xx,xy,xz,yy,yz,zz
+        real_flags = (True, False, False, True, False, True,
+                      True, False, False, True, False, True)
+        acc = [xp.zeros(nf, dtype=xp.float64 if r else xp.complex128) for r in real_flags]
+
+        # Accumulate the per-epoch transfer functions in CHUNKS: the materialised
+        # (n_epochs x n_freqs) buffer would be tens of GB at production n_freqs, so we
+        # bound the transient buffer to ~1 GB regardless of n_freqs / n_epochs.
+        chunk = max(1, min(N, int(1e9 // (nf * 16 * 12))))
+        for start in range(0, N, chunk):
+            cs = int(min(chunk, N - start))
+            bufs = [xp.empty(cs * nf, dtype=xp.float64 if r else xp.complex128) for r in real_flags]
+            self.pycpp_sensitivity_matrix.get_noise_tfs_wrap(
+                f_arr, *bufs, nf, cs, xp.arange(start, start + cs, dtype=xp.int32))
+            for k in range(12):
+                acc[k] += bufs[k].reshape(cs, nf).sum(axis=0)
+
+        # epoch mean -> 12 contiguous (nf,) arrays, KEPT ALIVE on self (non-owned in c++)
+        self._avg_tf_arrays = [xp.ascontiguousarray(a / N) for a in acc]
+        self.pycpp_sensitivity_matrix.set_averaged_tfs_wrap(*self._avg_tf_arrays, nf)
+
+    def __deepcopy__(self, memo):
+        """Custom deepcopy to handle unpicklable backend objects."""
+        from copy import copy
+
+        # Create a new instance without calling __init__
+        cls = self.__class__
+        new_obj = cls.__new__(cls)
+
+        # Copy the memo to avoid infinite recursion
+        memo[id(self)] = new_obj
+
+        # Manually copy attributes
+        for key, value in self.__dict__.items():
+            if key in ("_backend", "pycpp_sensitivity_matrix", "_galactic_grid", "_avg_tf_arrays"):
+                # Don't deepcopy backend objects - just reference.
+                # _avg_tf_arrays is referenced by raw pointers inside the (shared)
+                # pycpp_sensitivity_matrix, so copies MUST share these arrays.
+                setattr(new_obj, key, value)
+            elif key == "orbits":
+                # Shallow copy orbits (share the same backend)
+                setattr(new_obj, key, copy(value))
+            elif key == "spline_interpolant":
+                # Shallow copy spline interpolant
+                setattr(new_obj, key, copy(value))
+            else:
+                # Deepcopy everything else
+                setattr(new_obj, key, deepcopy(value, memo))
+        
+        return new_obj
+
+    def _setup_window(self):
+        """Setup window values for the c++ backend."""
+        if self.window_values is not None:
+            assert isinstance(self.window_values, np.ndarray) or isinstance(self.window_values, cp.ndarray)
+            assert self.window_values.ndim == 1
+
+            self.window_values = self.xp.asarray(self.window_values)
+
+            num_points = self.window_values.shape[0]
+            self.window_normalization = float(
+                self.xp.sum(self.window_values ** 2) / num_points
+            )
+        else:
+            self.window_normalization = 1.0
+                
+    def _init_basis_settings(self):
+        """Initialize basis settings from domain settings."""
+        self.f_arr = self.xp.asarray(self.basis_settings.f_arr)
+
+        if hasattr(self.basis_settings, "t_arr"):
+            self.t_arr = self.xp.asarray(self.basis_settings.t_arr)
+
+        self.num_times = len(self.t_arr) if hasattr(self, "t_arr") else 1
+        self.num_freqs = len(self.f_arr)
+
+        dips_indices = self._get_dips_indices()
+
+        dips_mask = self.xp.zeros((self.num_times, self.num_freqs), dtype=bool)
+        for t_idx in range(self.num_times):
+            dips_mask[t_idx, dips_indices[t_idx]] = True
+
+        self.dips_mask = dips_mask.flatten()
+
+    def _find_dips_with_percentage(self, tf, mask_percentage=0.05):
+        """Return indices of bins within ``mask_percentage`` of every transfer-function dip."""
+        f_arr = asnumpy(self.f_arr)
+        tf = asnumpy(tf)
+
+        peaks = find_peaks(-tf)[0]
+
+        all_indices = set()
+        for peak in peaks:
+            freq = self.f_arr[peak]
+            df = self.f_arr[1] - self.f_arr[0]
+
+            lower_freq = freq - mask_percentage * freq
+            upper_freq = freq + mask_percentage * freq
+
+            lower_idx = int(self.xp.searchsorted(self.f_arr, lower_freq - df / 2))
+            upper_idx = int(self.xp.searchsorted(self.f_arr, upper_freq + df / 2))
+
+            all_indices.update(range(lower_idx, upper_idx))
+
+        return self.xp.array(sorted(all_indices), dtype=self.xp.int32)
+
+    def _get_dips_indices(
+        self,
+    ):
+        """Compute per-time-slice indices of frequency bins around transfer-function dips."""
+        transfer_functions = self.compute_transfer_functions(self.f_arr)
+
+        tf = transfer_functions[0]
+
+        dips_indices = [
+            self._find_dips_with_percentage(tf[t_idx], mask_percentage=self.mask_percentage)
+            for t_idx in range(self.num_times)
+        ]
+
+        return dips_indices
+
+    def _sanitize_galactic_grid_kwargs(self, kwargs: dict) -> None:
+        """
+        Check that the galactic grid kwargs are valid and contain the necessary parameters.
+        
+        Args:
+            kwargs: Dictionary of galactic grid parameters to check. Expected keys include:
+                - R_d: Disk radial scale length [kpc]
+                - z_d: Disk vertical scale height [kpc]
+                - t0: Reference time at which to compute the initial LISA orbital phase and rotation angle.
+                - N_lambda: Number of ecliptic longitude points for quadrature (optional, default 90)
+                - N_beta: Number of ecliptic latitude points for quadrature (optional, default 60)
+                - galactic_grid: Optional pre-computed galactic grid object (e.g., from another instance) to reuse
+        """
+        required_keys = ["R_d", "z_d", "t0"]
+        for key in required_keys:
+            if key not in kwargs:
+                raise ValueError(f"Missing required galactic_grid_kwargs parameter: {key}")
+            if not isinstance(kwargs[key], (int, float)):
+                raise ValueError(f"Galactic grid parameter {key} must be a number (int or float).")
+
+        optional_keys = ["N_lambda", "N_beta", "galactic_grid"]
+        for key in optional_keys:
+            if key in kwargs and key == "galactic_grid":
+                # galactic_grid can be any object, so we won't check its type here
+                continue
+            elif key in kwargs:
+                if not isinstance(kwargs[key], int):
+                    raise ValueError(f"Galactic grid parameter {key} must be an integer.")
+
+    def _setup_galactic_grid(
+            self,
+            R_d: float,
+            z_d: float,
+            t0: float,
+            N_lambda: Optional[int] = 90,
+            N_beta: Optional[int] = 60,
+            galactic_grid: Optional[Any] = None
+        ) -> None:
+        """
+        Compute the fixed galactic sky geometry if not provided, and attach it to the sensitivity backend.
+
+        Called once during setup.  After this call, sensitivity_backend.pycpp_sensitivity_matrix
+        has gal_R_avg wired in and will include the galactic foreground in every likelihood
+        evaluation automatically, scaled by the per-walker spectral parameters passed via
+        Amp_all, alpha_all, f_1_all, f_knee_all, f_2_all.
+
+        Args:
+            R_d: Disk radial scale length [kpc]
+            z_d: Disk vertical scale height [kpc]
+            t0: Reference time at which to compute the initial LISA orbital phase and rotation angle.
+            N_lambda: Number of ecliptic longitude points for quadrature (default 90)
+            N_beta: Number of ecliptic latitude points for quadrature (default 60)
+            galactic_grid: Optional pre-computed galactic grid object (e.g., from another instance) to reuse
+        """
+        if galactic_grid is not None:
+            self._galactic_grid = galactic_grid
+
+            # logger.info("Using provided galactic grid object, skipping re-initialization.")
+            
+        else:
+            alpha0, beta0 = self.orbits.get_constellation_angles(t0)
+
+            # logger.debug(
+            #     f"Initializing galactic grid: R_d={R_d} kpc, z_d={z_d} kpc, "
+            #     f"alpha0={alpha0:.4f} rad, beta0={beta0:.4f} rad"
+            # )
+
+            # Build host-side quadrature geometry
+            setup = self.backend.GalacticGridSetup()
+            setup.compute(
+                N_lambda=N_lambda,
+                N_beta=N_beta,
+            )
+            
+            # logger.debug(f"Galactic sky grid: N_sky={setup.N_sky}, N_quad={setup.N_quad}")
+
+            if hasattr(self.basis_settings, "t_arr"):
+                _t_arr = self.basis_settings.t_arr.copy()
+            else:
+                _t_arr = np.array([t0])
+            #     logger.warning(
+            #     f"FD domain detected — using t=t0={t0} for galactic sky average. "
+            #     "This is correct only for stationary (non-cyclostationary) analyses."
+            # )
+
+            self._initialize_galactic_grid(
+                times=self.xp.asarray(_t_arr),
+                R_d=float(R_d),
+                z_d=float(z_d),
+                R_vals_quad=self.xp.asarray(setup.R_vals_quad),
+                z_vals_quad=self.xp.asarray(setup.z_vals_quad),
+                quad_weights=self.xp.asarray(setup.quad_weights),
+                cos_beta_ecl=self.xp.asarray(setup.cos_beta_ecl),
+                lam_ecl=self.xp.asarray(setup.lam_ecl),
+                beta_ecl=self.xp.asarray(setup.beta_ecl),
+                N_quad=setup.N_quad,
+                N_sky=setup.N_sky,
+                alpha0=float(alpha0),
+                beta0=float(beta0),
+                t0=float(t0)
+            )
+
+            # logger.info("Galactic grid initialized.")
+
+        self.pycpp_sensitivity_matrix.set_galactic_grid(self._galactic_grid)
+        # logger.info("Galactic grid attached to sensitivity backend.")
+
+    def _initialize_galactic_grid(
+        self,
+        times: np.ndarray,
+        R_d: float,
+        z_d: float,
+        R_vals_quad: np.ndarray,
+        z_vals_quad: np.ndarray,
+        quad_weights: np.ndarray,
+        cos_beta_ecl: np.ndarray,
+        lam_ecl: np.ndarray,
+        beta_ecl: np.ndarray,
+        N_quad: int,
+        N_sky: int,
+        alpha0: float,
+        beta0: float,
+        t0: float
+    ) -> None:
+        """
+        Build the GalacticGridWrap, compute fixed sky weights and R_avg, and
+        attach to the C++ sensitivity matrix.  Call once before inference.
+
+        The grid is stored on self and propagated to any copies made via __call__.
+
+        Args:
+            times:        Segment centre times (N_times,)
+            R_d:          Disk radial scale length [kpc]
+            z_d:          Disk vertical scale height [kpc]
+            R_vals_quad:  (N_quad * N_sky,) galactocentric radii
+            z_vals_quad:  (N_quad * N_sky,) heights above disk
+            quad_weights: (N_quad,) Gauss-Legendre weights
+            cos_beta_ecl: (N_sky,) cos(beta) for solid-angle weighting
+            lam_ecl:      (N_sky,) ecliptic longitudes
+            beta_ecl:     (N_sky,) ecliptic latitudes
+            N_quad:       Number of quadrature nodes (16)
+            N_sky:        Number of sky pixels
+            alpha0:       LISA orbit initial phase (rad)
+            beta0:        LISA orbit inclination (rad)
+            t0:           Reference time for constellation angles (s)
+        """
+        GalWrap = self.backend.GalacticGridWrap
+
+        self._galactic_grid = GalWrap(
+            self.xp.asarray(R_vals_quad),
+            self.xp.asarray(z_vals_quad),
+            self.xp.asarray(quad_weights),
+            self.xp.asarray(cos_beta_ecl),
+            self.xp.asarray(lam_ecl),
+            self.xp.asarray(beta_ecl),
+            N_quad,
+            N_sky,
+            alpha0,
+            beta0,
+            t0,
+            self.num_times,
+            self.num_freqs,
+        )
+
+        self._galactic_grid.initialize_wrap(
+            self.xp.asarray(times),
+            R_d,
+            z_d,
+            len(times),
+        )
+
+    def disable_galactic_grid(self) -> None:
+        """Detach the galactic foreground from all subsequent likelihood evaluations.
+
+        Clears ``self._galactic_grid`` and instructs the C++ backend to stop adding
+        the galactic foreground term to the covariance matrix.  To re-enable, call
+        :meth:`_setup_galactic_grid` again with the appropriate parameters.
+        """
+        self._galactic_grid = None
+        self.pycpp_sensitivity_matrix.disable_galactic_grid()
+
+    def _compute_matrix_elements(
+        self,
+        freqs,
+        Soms_d_in=15e-12,
+        Sa_a_in=3e-15,
+        Amp=0,
+        alpha=0,
+        f_1=0,
+        kn=0,
+        f_2=0,
+        knots_position_all: NDArrayLike = None,
+        knots_amplitude_all: NDArrayLike = None,
+    ):
+        """Compute the 6 sensitivity matrix terms using the c++ backend."""
+
+        xp = self.xp
+        total_terms = self.basis_settings.total_terms
+
+        c00 = xp.empty(total_terms, dtype=xp.float64)
+        c11 = xp.empty(total_terms, dtype=xp.float64)
+        c22 = xp.empty(total_terms, dtype=xp.float64)
+        c01 = xp.empty(total_terms, dtype=xp.complex128)
+        c02 = xp.empty(total_terms, dtype=xp.complex128)
+        c12 = xp.empty(total_terms, dtype=xp.complex128)
+
+        if self.use_splines:
+            assert knots_position_all is not None and knots_amplitude_all is not None
+            splines_out = self.spline_interpolant(xp.log10(freqs), knots_position_all, knots_amplitude_all)
+            splines_in_isi_oms = splines_out[0]
+            spline_in_testmass = splines_out[1]
+        else:
+            splines_in_isi_oms = xp.zeros(len(freqs), dtype=xp.float64)
+            spline_in_testmass = xp.zeros(len(freqs), dtype=xp.float64)
+
+        if self.pycpp_sensitivity_matrix is None:
+            raise RuntimeError("XYZBackend disabled (symbol issues on Linux): get_noise_covariance unavailable.")
+        self.pycpp_sensitivity_matrix.get_noise_covariance_wrap(
+            xp.asarray(freqs),
+            self.time_indices,
+            float(Soms_d_in),
+            float(Sa_a_in),
+            float(Amp),
+            float(alpha),
+            float(f_1),
+            float(kn),
+            float(f_2),
+            splines_in_isi_oms,
+            spline_in_testmass,
+            c00,
+            c01,
+            c02,
+            c11,
+            c12,
+            c22,
+            len(freqs),
+            len(self.time_indices),
+        )
+
+        return c00, c11, c22, c01, c02, c12
+
+    def _fill_matrix(self, c00, c11, c22, c01, c02, c12):
+        """Fill the full 3x3 sensitivity matrix from its 6 unique elements."""
+        xp = self.xp
+        shape = self.basis_settings.basis_shape_active
+
+        # Reshape views (no copy)
+        c00 = c00.reshape(shape)
+        c11 = c11.reshape(shape)
+        c22 = c22.reshape(shape)
+        c01 = c01.reshape(shape)
+        c02 = c02.reshape(shape)
+        c12 = c12.reshape(shape)
+
+        # Direct assignment is faster than stack (no intermediate copies)
+        matrix = xp.empty(self.channel_shape + shape, dtype=xp.complex128)
+        matrix[0, 0] = c00
+        matrix[1, 1] = c11
+        matrix[2, 2] = c22
+        matrix[0, 1] = c01
+        matrix[1, 0] = c01.conj()
+        matrix[0, 2] = c02
+        matrix[2, 0] = c02.conj()
+        matrix[1, 2] = c12
+        matrix[2, 1] = c12.conj()
+
+        return matrix
+
+    def _extract_matrix_elements(self, matrix_in, flatten=False):
+        """Extract the 6 unique sensitivity matrix elements from the full 3x3 matrix."""
+
+        c00 = matrix_in[0, 0].real
+        c11 = matrix_in[1, 1].real
+        c22 = matrix_in[2, 2].real
+        c01 = matrix_in[0, 1]
+        c02 = matrix_in[0, 2]
+        c12 = matrix_in[1, 2]
+
+        if flatten:
+            return (
+                c00.flatten(),
+                c11.flatten(),
+                c22.flatten(),
+                c01.flatten(),
+                c02.flatten(),
+                c12.flatten(),
+            )
+
+        return c00, c11, c22, c01, c02, c12
+
+    def compute_sensitivity_matrix(
+        self,
+        freqs: NDArrayLike,
+        Soms_d_in: float = 15e-12,
+        Sa_a_in: float = 3e-15,
+        Amp: float = 0.0,
+        alpha: float = 0.0,
+        f_1: float = 0.0,
+        kn: float = 0.0,
+        f_2: float = 0.0,
+        knots_position_all: NDArrayLike = None,
+        knots_amplitude_all: NDArrayLike = None,
+        smooth: bool = False,
+    ) -> NDArrayLike:
+        """Compute the full 3×3 XYZ covariance matrix at arbitrary frequencies.
+
+        Calls the C++ kernel to evaluate all six independent matrix elements
+        (XX, YY, ZZ and the complex cross-terms XY, XZ, YZ) at ``freqs``, then
+        assembles the full Hermitian matrix.  If the galactic grid has been
+        initialised, the foreground contribution is added automatically via the
+        stored ``gal_R_avg``.
+
+        Unlike :meth:`set_sensitivity_matrix`, this method does **not** update the
+        internal ``sens_mat`` attribute; it is for one-off evaluations (e.g.,
+        diagnostics, plotting).
+
+        Args:
+            freqs: Frequency array at which to evaluate the matrix [Hz].
+                   Shape ``(n_freqs,)`` or ``(n_times, n_freqs)`` depending on the domain.
+            Soms_d_in: Displacement (OMS) noise amplitude ``S_oms`` [m/√Hz]. Default 15 pm/√Hz.
+            Sa_a_in: Test-mass acceleration noise amplitude ``S_acc`` [m s⁻²/√Hz]. Default 3 fm s⁻²/√Hz.
+            Amp: Galactic foreground spectral amplitude ``A`` [Hz⁻¹]. Pass 0 to omit.
+            alpha: Galactic foreground spectral index ``α`` (dimensionless).
+            f_1: Galactic foreground low-frequency roll-off scale ``f₁`` [Hz].
+            kn: Galactic foreground knee frequency ``f_knee`` [Hz].
+            f_2: Galactic foreground high-frequency roll-off scale ``f₂`` [Hz].
+            knots_position_all: Log10-frequency positions of spline knots for
+                noise residuals. Shape ``(2, n_knots)``. ``None`` if not using splines.
+            knots_amplitude_all: Spline knot amplitudes for noise residuals.
+                Shape ``(2, n_knots)``. ``None`` if not using splines.
+            smooth: If ``True``, apply Gaussian smoothing around the TDI notches
+                (zeros of the transfer function) before returning. Default ``False``.
+
+        Returns:
+            Hermitian covariance matrix ``Σ(f)``. Shape ``(3, 3, n_times, n_freqs)``
+            (or ``(3, 3, n_freqs)`` for FD analyses with a single time point),
+            dtype ``complex128``.
+        """
+        c00, c11, c22, c01, c02, c12 = self._compute_matrix_elements(
+            freqs,
+            Soms_d_in,
+            Sa_a_in,
+            Amp,
+            alpha,
+            f_1,
+            kn,
+            f_2,
+            knots_position_all,
+            knots_amplitude_all,
+        )
+        matrix = self._fill_matrix(c00, c11, c22, c01, c02, c12)
+        
+        if smooth:
+            matrix = self.smooth_sensitivity_matrix(matrix, sigma=self.smoothing_sigma)
+
+        return matrix
+
+    def set_sensitivity_matrix(
+        self,
+        Soms_d_in: float = 15e-12,
+        Sa_a_in: float = 3e-15,
+        knots_position_all: NDArrayLike = None,
+        knots_amplitude_all: NDArrayLike = None,
+        Amp: float = 0.0,
+        alpha: float = 0.0,
+        f_1: float = 0.0,
+        kn: float = 0.0,
+        f_2: float = 0.0,
+    ) -> None:
+        """Evaluate and store the covariance matrix at the domain's basis frequencies.
+
+        Computes the 3×3 XYZ covariance matrix at ``self.f_arr`` via the C++ kernel,
+        applies Gaussian smoothing around the TDI transfer-function notches, and
+        stores the result in ``self.sens_mat``.  The inverse and log-determinant
+        (``self.invC``, ``self.detC``) are recomputed immediately via
+        :meth:`_setup_det_and_inv`.
+
+        This is the method called by :meth:`__call__` to update a per-walker copy of
+        the backend with new PSD/foreground parameters at each MCMC step.
+
+        Args:
+            Soms_d_in: Displacement (OMS) noise amplitude ``S_oms`` [m/√Hz]. Default 15 pm/√Hz.
+            Sa_a_in: Test-mass acceleration noise amplitude ``S_acc`` [m s⁻²/√Hz]. Default 3 fm s⁻²/√Hz.
+            knots_position_all: Log10-frequency positions of spline knots for noise
+                residuals. Shape ``(2, n_knots)``. ``None`` if not using splines.
+            knots_amplitude_all: Spline knot amplitudes for noise residuals.
+                Shape ``(2, n_knots)``. ``None`` if not using splines.
+            Amp: Galactic foreground spectral amplitude ``A`` [Hz⁻¹]. Pass 0 to omit.
+            alpha: Galactic foreground spectral index ``α`` (dimensionless).
+            f_1: Galactic foreground low-frequency roll-off scale ``f₁`` [Hz].
+            kn: Galactic foreground knee frequency ``f_knee`` [Hz].
+            f_2: Galactic foreground high-frequency roll-off scale ``f₂`` [Hz].
+        """
+
+        c00, c11, c22, c01, c02, c12 = self._compute_matrix_elements(
+            self.f_arr,
+            Soms_d_in,
+            Sa_a_in,
+            Amp,
+            alpha,
+            f_1,
+            kn,
+            f_2,
+            knots_position_all,
+            knots_amplitude_all,
+        )
+
+        sens_mat = self._fill_matrix(c00, c11, c22, c01, c02, c12)
+
+        self.sens_mat = self.smooth_sensitivity_matrix(sens_mat, sigma=self.smoothing_sigma)
+
+    def _setup_det_and_inv(self):
+        """use the c++ backend to compute the log-determinant and inverse of the sensitivity matrix."""
+        c00, c11, c22, c01, c02, c12 = self._extract_matrix_elements(self.sens_mat, flatten=True)
+        self.invC, self.detC = self._inverse_det_wrapper(c00, c11, c22, c01, c02, c12)
+
+    def _inverse_det_wrapper(
+        self,
+        c00: NDArrayLike,
+        c11: NDArrayLike,
+        c22: NDArrayLike,
+        c01: NDArrayLike,
+        c02: NDArrayLike,
+        c12: NDArrayLike,
+    ) -> tuple:
+        """Wrapper to call c++ backend for inverse log-determinant computation."""
+
+        xp = self.xp
+        total_terms = self.basis_settings.total_terms
+
+        i00 = xp.empty(total_terms, dtype=xp.float64)
+        i11 = xp.empty(total_terms, dtype=xp.float64)
+        i22 = xp.empty(total_terms, dtype=xp.float64)
+        i01 = xp.empty(total_terms, dtype=xp.complex128)
+        i02 = xp.empty(total_terms, dtype=xp.complex128)
+        i12 = xp.empty(total_terms, dtype=xp.complex128)
+
+        det = xp.empty(total_terms, dtype=xp.float64)
+
+        if self.pycpp_sensitivity_matrix is None:
+            raise RuntimeError("XYZBackend disabled (symbol issues on Linux): get_inverse_det unavailable.")
+        self.pycpp_sensitivity_matrix.get_inverse_det_wrap(
+            c00, c01, c02, c11, c12, c22, i00, i01, i02, i11, i12, i22, det, total_terms
+        )
+
+        inverse_matrix = self._fill_matrix(i00, i11, i22, i01, i02, i12)
+
+        return inverse_matrix, det.reshape(self.basis_settings.basis_shape_active)
+
+    def compute_inverse_det(self, matrix_in: NDArrayLike) -> tuple:
+        """
+        Invert the 3x3 sensitivity matrix and compute its log-determinant with the c++ backend.
+
+        Args:
+            matrix_in: Input sensitivity matrix. Shape (3, 3, ...)
+
+        Returns:
+            inverse_matrix: Inverted sensitivity matrix. Shape (3, 3, ...)
+            det: Determinant of the sensitivity matrix. Shape (...)
+        """
+        c00, c11, c22, c01, c02, c12 = self._extract_matrix_elements(matrix_in, flatten=True)
+        inverse_matrix, det = self._inverse_det_wrapper(c00, c11, c22, c01, c02, c12)
+        return inverse_matrix, det
+
+    def compute_transfer_functions(self, freqs: NDArrayLike) -> tuple[NDArrayLike]:
+        """Compute the OMS and test-mass noise transfer functions at arbitrary frequencies.
+
+        Evaluates the 12 independent transfer-function elements (6 OMS + 6 TM,
+        covering XX, XY, XZ, YY, YZ, ZZ for each) at ``freqs`` using the C++
+        kernel.  These are the pure geometric transfer functions without any noise
+        amplitude applied; multiply by ``Soms_d`` / ``Sa_a`` to get the noise PSD
+        contribution.  The results are also used internally to locate the TDI notches
+        (zeros) that should be masked during smoothing.
+
+        Args:
+            freqs: Frequency array [Hz]. Shape ``(n_freqs,)``.
+
+        Returns:
+            12-tuple of arrays, each of shape ``(n_times, n_freqs)``:
+            ``(oms_xx, oms_xy, oms_xz, oms_yy, oms_yz, oms_zz,
+               tm_xx,  tm_xy,  tm_xz,  tm_yy,  tm_yz,  tm_zz)``.
+            Diagonal elements (``*_xx``, ``*_yy``, ``*_zz``) are real-valued;
+            off-diagonal elements are complex.
+        """
+
+        xp = self.xp
+        num_freqs = len(freqs)
+
+        total_shape = self.num_times * num_freqs
+
+        oms_xx = xp.empty(shape=(total_shape,), dtype=xp.float64)
+        oms_yy = xp.empty(shape=(total_shape,), dtype=xp.float64)
+        oms_zz = xp.empty(shape=(total_shape,), dtype=xp.float64)
+        oms_xy = xp.empty(shape=(total_shape,), dtype=xp.complex128)
+        oms_xz = xp.empty(shape=(total_shape,), dtype=xp.complex128)
+        oms_yz = xp.empty(shape=(total_shape,), dtype=xp.complex128)
+
+        tm_xx = xp.empty(shape=(total_shape,), dtype=xp.float64)
+        tm_yy = xp.empty(shape=(total_shape,), dtype=xp.float64)
+        tm_zz = xp.empty(shape=(total_shape,), dtype=xp.float64)
+        tm_xy = xp.empty(shape=(total_shape,), dtype=xp.complex128)
+        tm_xz = xp.empty(shape=(total_shape,), dtype=xp.complex128)
+        tm_yz = xp.empty(shape=(total_shape,), dtype=xp.complex128)
+
+        if self.pycpp_sensitivity_matrix is None:
+            raise RuntimeError("XYZBackend disabled (symbol issues on Linux): get_noise_tfs unavailable.")
+        self.pycpp_sensitivity_matrix.get_noise_tfs_wrap(
+            xp.asarray(freqs),
+            oms_xx,
+            oms_xy,
+            oms_xz,
+            oms_yy,
+            oms_yz,
+            oms_zz,
+            tm_xx,
+            tm_xy,
+            tm_xz,
+            tm_yy,
+            tm_yz,
+            tm_zz,
+            num_freqs,
+            self.num_times,
+            self._time_indices,
+        )
+
+        return (
+            oms_xx.reshape(self.num_times, num_freqs),
+            oms_xy.reshape(self.num_times, num_freqs),
+            oms_xz.reshape(self.num_times, num_freqs),
+            oms_yy.reshape(self.num_times, num_freqs),
+            oms_yz.reshape(self.num_times, num_freqs),
+            oms_zz.reshape(self.num_times, num_freqs),
+            tm_xx.reshape(self.num_times, num_freqs),
+            tm_xy.reshape(self.num_times, num_freqs),
+            tm_xz.reshape(self.num_times, num_freqs),
+            tm_yy.reshape(self.num_times, num_freqs),
+            tm_yz.reshape(self.num_times, num_freqs),
+            tm_zz.reshape(self.num_times, num_freqs),
+        )
+
+    def compute_log_like(
+        self,
+        data_in_all: NDArrayLike,
+        data_index_all: NDArrayLike,
+        Soms_in_all: NDArrayLike,
+        Sa_in_all: NDArrayLike,
+        Amp_in_all: NDArrayLike,
+        alpha_in_all: NDArrayLike,
+        f_1_in_all: NDArrayLike,
+        kn_in_all: NDArrayLike,
+        f_2_in_all: NDArrayLike,
+        knots_position_all: NDArrayLike = None,
+        knots_amplitude_all: NDArrayLike = None,
+        run_async: bool = False,
+    ) -> NDArrayLike:
+        """
+        Compute log-likelihood using the c++ backend.
+
+        Args:
+            data_in_all: Input data array. Shape (num_psds, num_freqs * num_times)
+            data_index_all: Data indices array to keep track of which data corresponds to which PSD. Shape (num_psds)
+            Soms_in_all: Displacement noise levels for each walker. Shape (num_psds)
+            Sa_in_all: Acceleration noise levels for each walker. Shape (num_psds)
+            Amp_in_all: Galactic foreground amplitude for each walker. Shape (num_psds)
+            alpha_in_all: Galactic foreground alpha for each walker. Shape (num_psds)
+            f_1_in_all: First galactic foreground scale-frequency parameter for each walker. Shape (num_psds)
+            kn_in_all: Galactic foreground knee frequency parameter for each walker. Shape (num_psds)
+            f_2_in_all: Second galactic foreground scale-frequency parameter for each walker. Shape (num_psds)
+            knots_position_all: Positions of spline knots for noise modeling. Shape (2 * num_psds, num_knots)
+            knots_amplitude_all: Amplitudes of spline knots for noise modeling. Shape (2 * num_psds, num_knots)
+            run_async: Whether to run the CUDA computation asynchronously. Default is False.
+
+        Returns:
+            log_like_out: Computed log-likelihoods for each PSD. Shape (num_psds,)
+        """
+
+        xp = self.xp
+
+        # sanitize input
+        Soms_in_all = xp.atleast_1d(Soms_in_all)
+        Sa_in_all = xp.atleast_1d(Sa_in_all)
+
+        Amp_in_all = xp.atleast_1d(Amp_in_all)
+        alpha_in_all = xp.atleast_1d(alpha_in_all)
+        f_1_in_all = xp.atleast_1d(f_1_in_all)
+        kn_in_all = xp.atleast_1d(kn_in_all)
+        f_2_in_all = xp.atleast_1d(f_2_in_all)
+        
+        # same for splines?
+
+        num_psds = len(Soms_in_all)
+
+        log_like_out = xp.zeros(shape=(num_psds,), dtype=xp.float64)
+
+        if self.use_splines:
+            splines_weights = self.spline_interpolant(
+                xp.log10(self.f_arr), knots_position_all, knots_amplitude_all
+            )
+            splines_weights_isi_oms = splines_weights[0].flatten()
+            splines_weights_testmass = splines_weights[1].flatten()
+            # splines_weights_isi_oms = splines_weights[:num_psds].flatten()
+            # splines_weights_testmass = splines_weights[num_psds:].flatten()
+
+        else:
+            splines_weights_isi_oms = xp.zeros(shape=(num_psds * self.num_freqs))
+            splines_weights_testmass = xp.zeros(shape=(num_psds * self.num_freqs))
+
+        if self.pycpp_sensitivity_matrix is None:
+            raise RuntimeError("XYZBackend disabled (symbol issues on Linux): psd_likelihood unavailable.")
+        self.pycpp_sensitivity_matrix.psd_likelihood_wrap(
+            log_like_out,
+            self.f_arr,
+            xp.asarray(data_in_all.flatten()),
+            xp.asarray(data_index_all.flatten()),
+            xp.asarray(self.time_indices),
+            xp.asarray(Soms_in_all),
+            xp.asarray(Sa_in_all),
+            xp.asarray(Amp_in_all),
+            xp.asarray(alpha_in_all),
+            xp.asarray(f_1_in_all),
+            xp.asarray(kn_in_all),
+            xp.asarray(f_2_in_all),
+            xp.asarray(splines_weights_isi_oms),
+            xp.asarray(splines_weights_testmass),
+            self.basis_settings.differential_component,
+            self.num_freqs,
+            self.num_times,
+            self.dips_mask,
+            num_psds,
+            run_async
+        )
+
+        return log_like_out
+
+    def smooth_sensitivity_matrix(
+        self,
+        matrix_in: NDArrayLike,
+        sigma: float = 5.0,
+    ) -> NDArrayLike:
+        """Smooth the sensitivity matrix around TDI transfer-function notches.
+
+        The TDI transfer functions have sharp zeros at multiples of ``f = c/(2L)``
+        (~0.1 Hz for LISA).  Near these notches the covariance matrix becomes
+        nearly singular, causing numerical issues in the inversion.  This method
+        replaces the matrix values at the masked notch frequencies with values
+        from a Gaussian-smoothed version of the matrix, leaving all other
+        frequencies untouched.
+
+        Smoothing is applied along the last axis (frequency) with
+        ``scipy.ndimage.gaussian_filter1d`` (CPU) or its CuPy equivalent (GPU).
+
+        Args:
+            matrix_in: Input sensitivity matrix. Trailing axes match
+                ``basis_shape_active`` — ``(num_freqs,)`` for FD,
+                ``(num_freqs, num_times)`` for WDM. The array is not modified
+                in-place.
+            sigma: Width of the Gaussian smoothing kernel in frequency bins.
+                Default 5.
+
+        Returns:
+            Smoothed sensitivity matrix, same shape and dtype as ``matrix_in``.
+        """
+        filter_func = np_gaussian_filter1d if self.xp == np else cp_gaussian_filter1d
+
+        smoothed_matrix = matrix_in.copy()
+        # ``dips_mask`` is stored flat as ``(num_times, num_freqs)`` rows;
+        # the sensitivity matrix's trailing axes are
+        # ``basis_shape_active`` which is ``(num_freqs,)`` for FD and
+        # ``(num_freqs, num_times)`` for WDM. Reshape and transpose so the
+        # mask matches the matrix layout.
+        mask = self.dips_mask.reshape(self.num_times, self.num_freqs)
+        if self.num_times == 1:
+            # FD: squeeze the time axis; mask is (num_freqs,).
+            mask = mask[0]
+        else:
+            # WDM: swap to (num_freqs, num_times) to match basis_shape_active.
+            mask = mask.T
+
+        _smoothed = filter_func(matrix_in, sigma=sigma, axis=-1)
+
+        smoothed_matrix[..., mask] = _smoothed[..., mask]
+
+        return smoothed_matrix
+
+    def build_spline_arrays(self, spline_params: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Unpack interleaved spline parameters into separate position and amplitude arrays.
+
+        The MCMC state stores spline parameters in an interleaved layout::
+
+            [amp₀, pos₀, amp₁, pos₁, ...,   # OMS knots
+             amp₀, pos₀, amp₁, pos₁, ...]   # TM knots
+
+        This method splits that flat vector into two ``(2, n_walkers, n_knots)``
+        arrays ready for the C++ Akima spline kernel.
+
+        Args:
+            spline_params: Interleaved spline parameters for one or more walkers.
+                Shape ``(n_walkers, 2 * n_knots_oms + 2 * n_knots_tm)`` or
+                ``(2 * n_knots_oms + 2 * n_knots_tm,)`` for a single walker.
+
+        Returns:
+            spline_knots_position: Log10-frequency positions of knots.
+                Shape ``(2, n_walkers, n_knots)`` — axis 0 indexes [OMS, TM].
+            spline_knots_amplitude: Knot amplitudes (multiplicative noise residuals).
+                Shape ``(2, n_walkers, n_knots)`` — axis 0 indexes [OMS, TM].
+        """
+        
+        spline_params = self.xp.atleast_2d(spline_params)
+
+        spline_knots_position = spline_params[:, 1::2]
+        spline_knots_amplitude = spline_params[:, 0:-1:2]
+        half = spline_knots_position.shape[1] // 2
+        spline_knots_amplitude = self.xp.stack((spline_knots_amplitude[:, :half], spline_knots_amplitude[:, half:]))
+        spline_knots_position = self.xp.stack((spline_knots_position[:, :half], spline_knots_position[:, half:]))
+
+        #todo should we sort the knots
+
+        return spline_knots_position, spline_knots_amplitude
+
+    def __call__(
+        self, name: str, psd_params: np.ndarray, galfor_params: np.ndarray = None
+    ) -> "XYZSensitivityBackend":
+        """Create a configured copy of this backend with updated noise parameters.
+
+        Used by :class:`~lisatools.globalfit.moves.psdmove.PSDMove` to produce a
+        per-walker sensitivity matrix at each MCMC step without re-initialising
+        expensive objects (orbits, galactic grid, spline interpolant).
+
+        The returned object shares the same C++ kernel and galactic grid as the
+        parent but has its ``sens_mat``, ``invC``, and ``detC`` attributes set
+        to the values implied by the supplied parameters.
+
+        Args:
+            name: Identifier label attached to the returned copy (``new_sens_mat.name``).
+            psd_params: Noise parameters for this walker.
+
+                - Without splines: ``[Soms_d, Sa_a]`` — shape ``(2,)``.
+                - With splines: ``[Soms_d, Sa_a, amp₀, pos₀, amp₁, pos₁, ...]``
+                  where the remaining elements are interleaved OMS + TM knot
+                  amplitudes and positions; see :meth:`build_spline_arrays`.
+
+            galfor_params: Galactic foreground parameters ``[Amp, alpha, f_1, kn, f_2]``
+                in physical (not log) units.  If ``None``, the foreground contribution
+                is zeroed out.
+
+        Returns:
+            A new :class:`XYZSensitivityBackend` instance with the sensitivity matrix,
+            its inverse, and log-determinant set to reflect the supplied parameters.
+
+        Notes:
+            The copy is a **shallow** :func:`copy.copy`, not a re-construction.  All
+            walker-independent state — orbits, spline interpolant, the C++ kernel
+            (``pycpp_sensitivity_matrix``), the galactic grid, ``f_arr``, ``dips_mask``,
+            window normalisation, basis settings — is shared by reference with the
+            parent.  Only the per-walker arrays differ, and they are *rebound* (not
+            mutated in place): :meth:`set_sensitivity_matrix` assigns a fresh
+            ``sens_mat`` whose setter recomputes ``invC``/``detC`` into new arrays, so
+            the parent's arrays are never touched.  This avoids re-allocating the C++
+            kernel / interpolant and recomputing the (walker-independent) light-travel
+            times and transfer-function dip mask on every MCMC step.
+        """
+        from copy import copy
+
+        # Shallow copy: shares the kernel, interpolant, orbits, galactic grid and
+        # all immutable basis arrays with the parent. set_sensitivity_matrix below
+        # rebinds sens_mat/invC/detC, so the shared template is never mutated.
+        new_sens_mat = copy(self)
+        new_sens_mat.name = name
+
+        Soms_d = psd_params[0]
+        Sa_a = psd_params[1]
+        if self.use_splines:  # assume transformed input.
+            spline_knots_position, spline_knots_amplitude = self.build_spline_arrays(psd_params[2:])
+        else:
+            spline_knots_position = None
+            spline_knots_amplitude = None
+
+        if galfor_params is None:
+            galfor_params = self.xp.zeros(5)
+
+        new_sens_mat.set_sensitivity_matrix(
+            Soms_d, Sa_a, spline_knots_position, spline_knots_amplitude, *galfor_params
+        )
+
+        return new_sens_mat
+
+
+# =============================================================================
+# Composite (additive, optionally time-modulated) sensitivity matrices.
+# =============================================================================
+#
+# The total noise covariance is built as a sum of independent components. Each
+# component contributes a covariance in the domain's basis; a component may also
+# carry a per-element time modulation, so that
+#
+#     C_{ij}[basis] = sum_c ( base_{c,ij}[basis] ) * M_{c,ij}[time]
+#
+# where ``M_c`` is ``1`` for stationary components. This mirrors the GLASS noise
+# model (``generate_full_dynamic_covariance_matrix``): a stationary instrument
+# term, a time-modulated galactic foreground, and a stationary SGWB summed into
+# one covariance.
+#
+# **Domain-agnostic by design.** The spectral part of every component goes
+# through :func:`get_sensitivity`, which dispatches on the domain settings
+# (FD -> ``Sn(f_arr)``, WDM -> folded wavelet PSD, ...), so the same component
+# classes work in any domain ``get_sensitivity`` supports. A *constant*
+# modulation works in every domain; a *time-varying* modulation requires the
+# domain to have a time axis (WDM, STFT, TD) -- see :func:`_basis_time_axis`.
+#
+# The assembled ``(nch, nch, *basis_shape_active)`` array is handed to
+# :class:`SensitivityMatrixBase`, which computes ``detC`` / ``invC`` -- so
+# :func:`~lisatools.diagnostic.inner_product` and
+# :func:`~lisatools.diagnostic.noise_likelihood_term` consume the result with no
+# changes.
+
+# Upper-triangle covariance elements, in the order used throughout this section.
+ELEMENTS = [(0, 0), (1, 1), (2, 2), (0, 1), (0, 2), (1, 2)]
+ELEMENT_NAMES = ["XX", "YY", "ZZ", "XY", "XZ", "YZ"]
+
+# TDI XYZ element sensitivity classes per generation, matching ELEMENTS order.
+_XYZ_ELEMENT_SENS = {
+    1: [X1TDISens, Y1TDISens, Z1TDISens, XY1TDISens, ZX1TDISens, YZ1TDISens],
+    2: [X2TDISens, Y2TDISens, Z2TDISens, XY2TDISens, ZX2TDISens, YZ2TDISens],
+}
+
+
+def _basis_time_axis(settings: domains.DomainSettingsBase) -> Optional[int]:
+    """Index of the time axis within ``basis_shape_active``, or ``None``.
+
+    Domains without a time axis (e.g. frequency-domain) return ``None``; only a
+    constant modulation is meaningful for those.
+    """
+    if isinstance(settings, domains.WDMSettings):
+        return 1  # basis_shape_active = (Nf, Nt)
+    if isinstance(settings, domains.STFTSettings):
+        return 0  # basis_shape_active = (NT, NF)
+    if isinstance(settings, domains.TDSettings):
+        return 0  # basis_shape_active = (N,)
+    return None  # FDSettings and anything else with no time axis
+
+
+def modulation_from_elements(
+    elements: dict, nchannels: int = 3
+) -> Callable[[np.ndarray], np.ndarray]:
+    """Build a ``(nch, nch, Ntime)`` modulation callable from six per-element entries.
+
+    Args:
+        elements: Mapping from element name (``"XX"``, ``"YY"``, ``"ZZ"``,
+            ``"XY"``, ``"XZ"``, ``"YZ"``) to a callable ``t_arr -> (Ntime,)`` or a
+            precomputed length-``Ntime`` array (or a scalar).
+        nchannels: Number of channels (3 for XYZ).
+
+    Returns:
+        A callable ``t_arr -> (nch, nch, Ntime)`` filling the symmetric matrix.
+    """
+
+    def _mod(t_arr):
+        xp = get_array_module(t_arr)
+        nt = t_arr.shape[0]
+        M = xp.zeros((nchannels, nchannels, nt))
+        for name, (i, j) in zip(ELEMENT_NAMES, ELEMENTS):
+            val = elements[name]
+            arr = val(t_arr) if callable(val) else xp.asarray(val)
+            M[i, j] = arr
+            M[j, i] = arr
+        return M
+
+    return _mod
+
+
+class NoiseComponent:
+    """Base class for an additive contribution to the noise covariance.
+
+    Subclasses return the full ``(nch, nch, *basis_shape_active)`` contribution
+    for the given domain settings. Use :class:`SeparableComponent` for the common
+    factorised case (a base covariance times a per-element modulation).
+    """
+
+    name: str = "component"
+    nchannels: int = 3
+
+    def covariance(self, settings: domains.DomainSettingsBase) -> np.ndarray:
+        raise NotImplementedError
+
+
+class SeparableComponent(NoiseComponent):
+    """A component whose covariance factorises as ``base_ij[basis] * M_ij[time]``.
+
+    Subclasses provide :meth:`base_covariance` (the stationary covariance in the
+    domain basis) and may override :meth:`time_modulation` (per-element factor;
+    defaults to ``None`` = stationary). The modulation may be:
+
+    * ``None`` — stationary (the base covariance is returned unchanged);
+    * a ``(nch, nch)`` constant matrix — applied in any domain;
+    * a ``(nch, nch, Ntime)`` array — requires a time axis; broadcast along it.
+    """
+
+    def base_covariance(self, settings: domains.DomainSettingsBase) -> np.ndarray:
+        """Stationary covariance in the domain basis: ``(nch, nch, *basis_shape_active)``."""
+        raise NotImplementedError
+
+    def time_modulation(self, settings: domains.DomainSettingsBase):
+        """Per-element modulation: ``None``, ``(nch,nch)``, or ``(nch,nch,Ntime)``."""
+        return None
+
+    def covariance(self, settings: domains.DomainSettingsBase) -> np.ndarray:
+        base = self.base_covariance(settings)  # (nch, nch, *basis)
+        mod = self.time_modulation(settings)
+        if mod is None:
+            return base
+
+        xp = settings.xp
+        mod = xp.asarray(mod)
+        nbasis = len(settings.basis_shape_active)
+
+        if mod.ndim == 2:
+            # constant matrix: broadcast over all basis axes (works in any domain)
+            idx = (slice(None), slice(None)) + (None,) * nbasis
+            return base * mod[idx]
+
+        if mod.ndim == 3:
+            time_axis = _basis_time_axis(settings)
+            if time_axis is None:
+                raise ValueError(
+                    f"{type(settings).__name__} has no time axis; a time-varying "
+                    "modulation (nch, nch, Ntime) is not allowed — use a constant "
+                    "(nch, nch) modulation instead."
+                )
+            ntime = mod.shape[2]
+            if ntime != settings.basis_shape_active[time_axis]:
+                raise ValueError(
+                    f"modulation time length {ntime} != basis time length "
+                    f"{settings.basis_shape_active[time_axis]}."
+                )
+            # place Ntime on the (channel-offset) time axis, size-1 elsewhere
+            shape = list(base.shape[:2]) + [1] * nbasis
+            shape[2 + time_axis] = ntime
+            return base * mod.reshape(shape)
+
+        raise ValueError("modulation must be 2D (nch,nch) or 3D (nch,nch,Ntime).")
+
+
+class InstrumentNoise(SeparableComponent):
+    """Stationary TDI instrument-noise covariance (no time modulation).
+
+    Args:
+        tdi_generation: 1 (TDI 1.5) or 2 (TDI 2.0).
+        model: LISA noise model (name or :class:`~lisatools.detector.LISAModel`).
+        fill_nans: Passed to :func:`get_sensitivity` (default ``np.nan``, matching
+            the stock matrices, leaves the ``f=0`` bin non-finite).
+    """
+
+    name = "instrument"
+
+    def __init__(self, tdi_generation: int = 2, model="sangria", fill_nans: float = np.nan):
+        if tdi_generation not in _XYZ_ELEMENT_SENS:
+            raise ValueError(f"tdi_generation must be 1 or 2, got {tdi_generation!r}.")
+        self.tdi_generation = tdi_generation
+        self.model = model
+        self.fill_nans = fill_nans
+        self.element_sens_fns = _XYZ_ELEMENT_SENS[tdi_generation]
+
+    def base_covariance(self, settings: domains.DomainSettingsBase) -> np.ndarray:
+        xp = settings.xp
+        nch = self.nchannels
+        elems = [
+            get_sensitivity(settings, sens_fn=fn, model=self.model, fill_nans=self.fill_nans)
+            for fn in self.element_sens_fns
+        ]
+        C = xp.zeros((nch, nch) + tuple(settings.basis_shape_active), dtype=elems[0].dtype)
+        for (i, j), arr in zip(ELEMENTS, elems):
+            C[i, j] = arr
+            C[j, i] = arr
+        return C
+
+
+class GalacticForeground(SeparableComponent):
+    """Galactic confusion foreground with a per-element time modulation.
+
+    Base covariance : the foreground *magnitude*
+    ``Sgal_mag[basis]`` — the auto-channel (XX) foreground in the domain basis —
+    is placed on every element, computed domain-agnostically as the X-channel
+    *stochastic-only* sensitivity (``include_instrument=False``), so no instrument
+    term is included here. The per-element structure (including the off-diagonal
+    sign) and the slow time variation live entirely in the modulation.
+
+    Args:
+        foreground_params: Parameters for ``stochastic_fn`` (for the default
+            :class:`HyperbolicTangentGalacticForeground` these are
+            ``(amp, fk, alpha, s1, s2)``).
+        modulation: One of: ``None`` (the isotropic/stationary limit — diagonals
+            ``1``, off-diagonals ``-1/2`` — which reproduces the stationary
+            foreground); a ``(nch, nch)`` constant matrix; a ``(nch, nch, Ntime)``
+            array; or a callable ``t_arr -> (nch, nch, Ntime)`` (build one from
+            six per-element functions with :func:`modulation_from_elements`).
+        tdi_generation: 1 or 2 (used to pick the X-channel sensitivity used to
+            extract the foreground magnitude).
+        stochastic_fn: Stochastic foreground model (class or name).
+    """
+
+    name = "galactic_foreground"
+
+    def __init__(
+        self,
+        foreground_params: Sequence[float],
+        modulation: Optional[object] = None,
+        tdi_generation: int = 2,
+        stochastic_fn=HyperbolicTangentGalacticForeground,
+    ):
+        if tdi_generation not in _XYZ_ELEMENT_SENS:
+            raise ValueError(f"tdi_generation must be 1 or 2, got {tdi_generation!r}.")
+        self.foreground_params = tuple(foreground_params)
+        self._modulation = modulation
+        self.tdi_generation = tdi_generation
+        self.stochastic_fn = check_stochastic(stochastic_fn)
+
+    def base_covariance(self, settings: domains.DomainSettingsBase) -> np.ndarray:
+        xp = settings.xp
+        nch = self.nchannels
+        Xsens = _XYZ_ELEMENT_SENS[self.tdi_generation][0]
+        # foreground magnitude in the domain basis: stochastic contribution only
+        # (no instrument term), folded through the same domain dispatch.
+        mag = get_sensitivity(
+            settings,
+            sens_fn=Xsens,
+            stochastic_params=self.foreground_params,
+            stochastic_function=self.stochastic_fn,
+            include_instrument=False,
+            fill_nans=0.0,
+        )
+        C = xp.zeros((nch, nch) + tuple(settings.basis_shape_active), dtype=mag.dtype)
+        for (i, j) in ELEMENTS:
+            C[i, j] = mag
+            C[j, i] = mag
+        return C
+
+    def time_modulation(self, settings: domains.DomainSettingsBase):
+        xp = settings.xp
+        nch = self.nchannels
+
+        if self._modulation is None:
+            # isotropic / stationary limit: diag = 1, off-diag = -1/2 (constant)
+            M = xp.full((nch, nch), -0.5)
+            for i in range(nch):
+                M[i, i] = 1.0
+            return M
+
+        if callable(self._modulation):
+            time_axis = _basis_time_axis(settings)
+            if time_axis is None:
+                raise ValueError(
+                    f"{type(settings).__name__} has no time axis; cannot evaluate a "
+                    "callable (time-varying) foreground modulation here."
+                )
+            return self._modulation(settings.t_arr)
+
+        return xp.asarray(self._modulation)
+
+
+class SGWB(SeparableComponent):
+    """Stochastic gravitational-wave background component (stationary by default).
+
+    The SGWB spectral template ``Sgw(f)`` is folded through the equal-arm TDI
+    response (``R_XX = 4 x^2 sin^2 x``, off-diagonals ``-1/2 R_XX``) and summed
+    into the covariance. Like the galactic foreground, the *magnitude* — the
+    auto-channel (XX) response in the domain basis — is extracted
+    domain-agnostically as the X-channel *stochastic-only* sensitivity
+    (``include_instrument=False``, no instrument term), and placed on every
+    element; the per-element structure lives in the modulation. The isotropic
+    default (diag ``1``, off-diag ``-1/2``) reproduces the equal-arm covariance
+    ``C_XY = -1/2 C_XX``. Pass a ``modulation`` for an anisotropic / time-varying
+    background.
+
+    This uses the analytic equal-arm response (the equal-arm limit of GLASS's
+    precomputed ``sgwb_response_xyz2.dat``); a tabulated unequal-arm response is
+    a possible later enhancement.
+
+    Args:
+        sgwb_params: Parameters for ``stochastic_fn`` — e.g.
+            :class:`~lisatools.stochastic.PowerLawSGWB` ``(log10_A, alpha)``,
+            :class:`~lisatools.stochastic.LogNormalSGWB`
+            ``(log10_A, log10_fstar, log10_D)``,
+            :class:`~lisatools.stochastic.PhaseTransitionSGWB`
+            ``(rb, b, log10_Ap, log10_fp)``.
+        stochastic_fn: SGWB spectral template (class or stock name).
+        modulation: ``None`` (stationary isotropic — the usual case); a
+            ``(nch, nch)`` constant matrix; a ``(nch, nch, Ntime)`` array; or a
+            callable ``t_arr -> (nch, nch, Ntime)``.
+        tdi_generation: 1 or 2 (used to pick the X-channel sensitivity used to
+            extract the SGWB magnitude).
+    """
+
+    name = "sgwb"
+
+    def __init__(
+        self,
+        sgwb_params: Sequence[float],
+        stochastic_fn,
+        modulation: Optional[object] = None,
+        tdi_generation: int = 2,
+    ):
+        if tdi_generation not in _XYZ_ELEMENT_SENS:
+            raise ValueError(f"tdi_generation must be 1 or 2, got {tdi_generation!r}.")
+        self.sgwb_params = tuple(sgwb_params)
+        self._modulation = modulation
+        self.tdi_generation = tdi_generation
+        self.stochastic_fn = check_stochastic(stochastic_fn)
+
+    def base_covariance(self, settings: domains.DomainSettingsBase) -> np.ndarray:
+        xp = settings.xp
+        nch = self.nchannels
+        Xsens = _XYZ_ELEMENT_SENS[self.tdi_generation][0]
+        # SGWB magnitude in the domain basis: stochastic contribution only
+        # (no instrument term), folded through the same domain dispatch.
+        mag = get_sensitivity(
+            settings,
+            sens_fn=Xsens,
+            stochastic_params=self.sgwb_params,
+            stochastic_function=self.stochastic_fn,
+            include_instrument=False,
+            fill_nans=0.0,
+        )
+        C = xp.zeros((nch, nch) + tuple(settings.basis_shape_active), dtype=mag.dtype)
+        for (i, j) in ELEMENTS:
+            C[i, j] = mag
+            C[j, i] = mag
+        return C
+
+    def time_modulation(self, settings: domains.DomainSettingsBase):
+        xp = settings.xp
+        nch = self.nchannels
+
+        if self._modulation is None:
+            # isotropic / stationary limit: diag = 1, off-diag = -1/2 (constant)
+            M = xp.full((nch, nch), -0.5)
+            for i in range(nch):
+                M[i, i] = 1.0
+            return M
+
+        if callable(self._modulation):
+            time_axis = _basis_time_axis(settings)
+            if time_axis is None:
+                raise ValueError(
+                    f"{type(settings).__name__} has no time axis; cannot evaluate a "
+                    "callable (time-varying) SGWB modulation here."
+                )
+            return self._modulation(settings.t_arr)
+
+        return xp.asarray(self._modulation)
+
+
+class CompositeSensitivityMatrix(SensitivityMatrixBase):
+    """Sensitivity matrix built as a sum of :class:`NoiseComponent` objects.
+
+    Args:
+        settings: Domain settings the matrix is evaluated on (FD, WDM, …).
+        components: :class:`NoiseComponent` list to sum. All must produce the same
+            ``(nch, nch, *basis_shape_active)`` shape.
+        skip_inv_det: Skip determinant/inverse computation (e.g. for slicing).
+    """
+
+    def __init__(
+        self,
+        settings: domains.DomainSettingsBase,
+        components: Sequence[NoiseComponent],
+        skip_inv_det: bool = False,
+    ):
+        SensitivityMatrixBase.__init__(self, settings, skip_inv_det=skip_inv_det)
+        self.components = list(components)
+        if not self.components:
+            raise ValueError("CompositeSensitivityMatrix needs at least one component.")
+        # Per-component contribution cache: a param change only recomputes the
+        # touched component before re-summing (the expensive det/inv runs once).
+        self._contrib_cache: dict[int, np.ndarray] = {}
+        self.rebuild()
+
+    def rebuild(self, indices: Optional[Sequence[int]] = None) -> None:
+        """(Re)compute component contributions and re-sum into ``sens_mat``.
+
+        Args:
+            indices: Component indices to recompute. ``None`` recomputes all;
+                cached contributions are reused for the rest.
+        """
+        if indices is None:
+            indices = range(len(self.components))
+        for i in indices:
+            self._contrib_cache[i] = self.components[i].covariance(self.basis_settings)
+
+        # Object-oriented sum: every intermediate ``+`` returns a
+        # :class:`SensitivityMatrixBase` with dirty ``invC`` / ``detC``, so the
+        # matrix inverse runs exactly once -- when this method's caller (or the
+        # likelihood code) first reads off the inverse.
+        accum = SensitivityMatrixBase(self.basis_settings)
+        accum.sens_mat = self._contrib_cache[0]
+        for i in range(1, len(self.components)):
+            accum = accum + self._contrib_cache[i]
+        # adopt the summed array onto self; the assignment marks self dirty so
+        # invC / detC will be lazily computed on first read off the composite.
+        self.sens_mat = accum.sens_mat
+
+    def update_component(self, index: int) -> None:
+        """Recompute a single component (after changing its params) and re-sum."""
+        self.rebuild(indices=[index])
+
+
+class CompositeSensitivityBackend:
+    """Callable wrapper that produces :class:`CompositeSensitivityMatrix` instances
+    parameterised by per-walker PSD (and optional galactic-foreground / SGWB)
+    coordinates.
+
+    The call signature mirrors :meth:`XYZSensitivityBackend.__call__` so the
+    object can be slotted into ``GeneralSetup.sensitivity_backend`` without any
+    changes in the global-fit run/move code. Each call returns a fresh
+    :class:`CompositeSensitivityMatrix` that sums an :class:`InstrumentNoise`
+    component (rebuilt with the walker's Soms_d / Sa_a) and optionally a
+    :class:`GalacticForeground` component (when ``galfor_params`` is supplied),
+    plus any extra stationary components passed at construction.
+
+    Args:
+        settings: Domain settings the matrix is evaluated on (FD, WDM, ...).
+        tdi_generation: 1 (TDI 1.5) or 2 (TDI 2.0).
+        model_name: Name to record on the constructed :class:`LISAModel`.
+        instrument_fill_nans: ``fill_nans`` value forwarded to
+            :class:`InstrumentNoise`. Defaults to ``0.0`` so the WDM fold of
+            the FD ``f=0`` divergence doesn't leave NaNs in the matrix; the
+            zeroed cells get filtered by :func:`noise_likelihood_term`'s
+            ``detC`` mask downstream.
+        galfor_stochastic_fn: Stochastic-model class used for the optional
+            :class:`GalacticForeground` component (only used when the caller
+            supplies ``galfor_params``).
+        extra_components: Additional :class:`NoiseComponent` instances added
+            to every constructed matrix — e.g. a stationary SGWB. These are
+            held by reference so they're built once and reused.
+    """
+
+    def __init__(
+        self,
+        settings: DomainSettingsBase,
+        *,
+        tdi_generation: int = 2,
+        model_name: str = "sangria",
+        instrument_fill_nans: float = 0.0,
+        galfor_stochastic_fn=HyperbolicTangentGalacticForeground,
+        extra_components: Optional[Sequence[NoiseComponent]] = None,
+    ):
+        self.basis_settings = settings
+        self.tdi_generation = tdi_generation
+        self.model_name = model_name
+        self.instrument_fill_nans = instrument_fill_nans
+        self.galfor_stochastic_fn = galfor_stochastic_fn
+        self.extra_components = list(extra_components) if extra_components else []
+        # ``LISAModel.lisanoises`` only reads Soms_d / Sa_a — the orbits field
+        # is just a carrier here, so one shared instance is fine.
+        self._orbits = lisa_models.DefaultOrbits()
+
+    def __call__(
+        self,
+        name: str,
+        psd_params,
+        galfor_params=None,
+        transform_fn: Optional[TransformContainer] = None,
+    ) -> CompositeSensitivityMatrix:
+        """Build a per-walker :class:`CompositeSensitivityMatrix`.
+
+        Args:
+            name: Identifier (e.g. ``"walker_3"``) recorded on the LISAModel.
+            psd_params: ``[Soms_d, Sa_a]`` in linear (square-root) units, matching
+                the convention used by :class:`XYZSensitivityBackend`.
+            galfor_params: Optional galactic-foreground parameters. When given,
+                a :class:`GalacticForeground` component is added.
+            transform_fn: Optional :class:`TransformContainer`. Applied to
+                ``psd_params`` first if provided.
+
+        Returns:
+            A freshly built :class:`CompositeSensitivityMatrix`.
+        """
+        params = np.asarray(psd_params, dtype=float)
+        if transform_fn is not None:
+            params = transform_fn.both_transforms(
+                params, copy=True, return_transpose=False
+            )
+            params = np.atleast_1d(np.asarray(params).squeeze())
+        Soms_d = float(params[0])
+        Sa_a = float(params[1])
+        model = lisa_models.LISAModel(
+            Soms_d ** 2, Sa_a ** 2, self._orbits, f"{self.model_name}:{name}"
+        )
+        components: list[NoiseComponent] = [
+            InstrumentNoise(
+                tdi_generation=self.tdi_generation,
+                model=model,
+                fill_nans=self.instrument_fill_nans,
+            ),
+        ]
+        if galfor_params is not None:
+            components.append(
+                GalacticForeground(
+                    foreground_params=np.asarray(galfor_params, dtype=float),
+                    tdi_generation=self.tdi_generation,
+                    stochastic_fn=self.galfor_stochastic_fn,
+                )
+            )
+        components.extend(self.extra_components)
+        _tmp = CompositeSensitivityMatrix(self.basis_settings, components)
+        return _tmp

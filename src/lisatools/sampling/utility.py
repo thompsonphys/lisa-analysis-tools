@@ -1,5 +1,7 @@
-from multiprocessing.sharedctypes import Value
+"""Helper utilities for LISA sampling: GB grouping, state restoration, updates."""
+
 import os
+from multiprocessing.sharedctypes import Value
 
 import numpy as np
 
@@ -9,11 +11,34 @@ try:
 except (ImportError, ModuleNotFoundError) as e:
     pass
 
-from eryn.state import State, BranchSupplemental
+from eryn.state import BranchSupplemental, State
+from eryn.utils.transform import TransformContainer
 from eryn.utils.utility import groups_from_inds
+
+from ..utils.utility import asnumpy
 
 
 class DetermineGBGroups:
+    """Group equivalent GB sources across walkers using waveform mismatches.
+
+    Given an ``eryn`` state holding GB parameters from many walkers, walks
+    through the walkers and clusters their leaves into "groups" by computing
+    pairwise waveform mismatches against representatives drawn from each
+    group. Two leaves are merged into the same group if their mismatch (and
+    a secondary ``normalized_against_test`` check) falls below the supplied
+    thresholds.
+
+    Args:
+        gb_wave_generator: GB waveform generator with a
+            ``swap_likelihood_difference`` method (typically from
+            ``gbgpu``). Provides the array module used internally.
+        transform_fn: Optional dictionary of ``TransformContainer`` objects
+            keyed by branch name; applied to coordinates before evaluating
+            waveforms.
+        waveform_kwargs: Default waveform keyword arguments; merged with the
+            per-call kwargs.
+    """
+
     def __init__(self, gb_wave_generator, transform_fn=None, waveform_kwargs={}):
         self.gb_wave_generator = gb_wave_generator
         self.xp = self.gb_wave_generator.xp
@@ -34,6 +59,37 @@ class DetermineGBGroups:
         waveform_kwargs={},
         index_within_group="random",
     ):
+        """Cluster GB leaves into groups across walkers.
+
+        Args:
+            last_sample: Either an ``eryn`` ``State`` or a dict-like sample
+                with the same ``branches_coords`` / ``branches_inds`` layout.
+            name_here: Branch name to operate on (e.g. ``"gb"``).
+            check_temp: Temperature index to use when reading ``last_sample``.
+            input_groups: Pre-existing list of groups to extend rather than
+                seed from a single walker.
+            input_groups_inds: Index list paired with ``input_groups``
+                containing ``[walker, leaf]`` pairs for each group entry.
+            fix_group_count: If ``True``, do not create new groups; orphan
+                leaves are discarded.
+            mismatch_lim: Maximum waveform mismatch for a leaf to join an
+                existing group.
+            double_check_lim: Secondary tolerance on the
+                ``add_remove / remove_remove`` ratio used as a sanity check.
+            start_term: Strategy for the seed walker when ``input_groups`` is
+                ``None``: ``"max"`` (most leaves), ``"first"``, or
+                ``"random"``.
+            waveform_kwargs: Per-call waveform keyword arguments; merged with
+                the constructor defaults.
+            index_within_group: Strategy for picking a representative within
+                each group: ``"first"`` or ``"random"``.
+
+        Returns:
+            Tuple ``(groups, groups_inds, group_lens)`` where each entry of
+            ``groups`` is a list of GB coordinate arrays, the matching entry
+            of ``groups_inds`` is a list of ``[walker, leaf]`` index pairs,
+            and ``group_lens`` lists the size of each group.
+        """
         # TODO: mess with mismatch lim setting
         # TODO: some time of mismatch annealing may be useful
         if isinstance(last_sample, State):
@@ -181,11 +237,7 @@ class DetermineGBGroups:
             test1 = np.abs(
                 1.0 - normalized_autocorr.real
             )  # (numerator / norm_for_test[None, :]).real)
-            best = test1.argmin(axis=1)
-            try:
-                best = best.get()
-            except AttributeError:
-                pass
+            best = asnumpy(test1.argmin(axis=1))
             best_mismatch = test1[(np.arange(test1.shape[0]), best)]
             check_normalized_against_test = np.abs(
                 1.0 - normalized_against_test[(np.arange(test1.shape[0]), best)]
@@ -213,6 +265,23 @@ class DetermineGBGroups:
 
 
 class GetLastGBState:
+    """Reload the most recent GB ``eryn`` state and rebuild the GPU residual.
+
+    Used when restarting a galactic-binary search: takes the latest sample
+    from a backend reader, optionally copies one temperature into a list of
+    other temperatures, resizes the leaf axis to match the requested
+    ``nleaves_max``, and reconstructs the residual ``data - template``
+    stored in the multi-GPU data holder ``mgh`` so that subsequent sampling
+    is consistent with the saved state.
+
+    Args:
+        gb_wave_generator: GB waveform generator capable of populating
+            global templates on the GPU.
+        transform_fn: Mapping from branch names to ``TransformContainer``
+            instances applied to coordinates before generating waveforms.
+        waveform_kwargs: Default waveform keyword arguments.
+    """
+
     def __init__(self, gb_wave_generator, transform_fn=None, waveform_kwargs={}):
         self.gb_wave_generator = gb_wave_generator
         self.xp = self.gb_wave_generator.xp
@@ -230,22 +299,41 @@ class GetLastGBState:
         nleaves_max_in=None,
         waveform_kwargs={},
     ):
+        """Restore the GB state and rebuild the residual on the GPU.
+
+        Args:
+            mgh: Multi-GPU data holder providing
+                ``data_list``, ``data_length``, ``gpu_splits``, and the
+                temperature / walker index arrays used for supplementals.
+            reader: ``eryn`` backend reader exposing ``get_last_sample``.
+            df: Frequency spacing used to scale the residual contributions.
+            supps_base_shape: Shape passed to
+                :class:`eryn.state.BranchSupplemental` for the rebuilt
+                supplementals object.
+            fix_temp_initial_ind: Optional source temperature index to copy
+                into ``fix_temp_inds`` (must be supplied together).
+            fix_temp_inds: Optional list of destination temperature indices.
+            nleaves_max_in: New maximum-leaves dimension; if larger than the
+                stored value, the coordinate / inds arrays are zero-padded.
+            waveform_kwargs: Per-call waveform kwargs; merged with the
+                constructor defaults. Must contain ``"start_freq_ind"``.
+
+        Returns:
+            The reconstructed ``State`` with updated ``log_like`` and
+            ``supplimental`` fields.
+        """
 
         xp.cuda.runtime.setDevice(mgh.gpus[0])
 
         if fix_temp_initial_ind is not None or fix_temp_inds is not None:
             if fix_temp_initial_ind is None or fix_temp_inds is None:
-                raise ValueError(
-                    "If giving fix_temp_initial_ind or fix_temp_inds, must give both."
-                )
+                raise ValueError("If giving fix_temp_initial_ind or fix_temp_inds, must give both.")
 
         state = reader.get_last_sample()
 
         waveform_kwargs = {**self.waveform_kwargs, **waveform_kwargs}
         if "start_freq_ind" not in waveform_kwargs:
-            raise ValueError(
-                "In get_last_gb_state, waveform_kwargs must include 'start_freq_ind'."
-            )
+            raise ValueError("In get_last_gb_state, waveform_kwargs must include 'start_freq_ind'.")
 
         # check = reader.get_last_sample()
         ntemps, nwalkers, nleaves_max_old, ndim = state.branches["gb"].shape
@@ -272,12 +360,8 @@ class GetLastGBState:
                     state.branches_coords["gb"][i] = state.branches_coords["gb"][
                         fix_temp_initial_ind
                     ]
-                    state.branches_inds["gb"][i] = state.branches_inds["gb"][
-                        fix_temp_initial_ind
-                    ]
-                    state.branches_inds["gb"][i] = state.branches_inds["gb"][
-                        fix_temp_initial_ind
-                    ]
+                    state.branches_inds["gb"][i] = state.branches_inds["gb"][fix_temp_initial_ind]
+                    state.branches_inds["gb"][i] = state.branches_inds["gb"][fix_temp_initial_ind]
 
             ntemps, nwalkers, nleaves_max_old, ndim = state.branches["gb"].shape
             if nleaves_max_in is None:
@@ -301,9 +385,7 @@ class GetLastGBState:
             # add "gb" if there are any
             data_index_in = groups_from_inds({"gb": state.branches_inds["gb"]})["gb"]
 
-            data_index = xp.asarray(mgh.get_mapped_indices(data_index_in)).astype(
-                xp.int32
-            )
+            data_index = xp.asarray(mgh.get_mapped_indices(data_index_in)).astype(xp.int32)
 
             params_add_in = self.transform_fn["gb"].both_transforms(
                 state.branches_coords["gb"][state.branches_inds["gb"]]
@@ -349,9 +431,7 @@ class GetLastGBState:
 
         self.gb_wave_generator.d_d = np.asarray(mgh.get_inner_product(use_cpu=True))
 
-        state.log_like = (
-            -1 / 2 * self.gb_wave_generator.d_d.real.reshape(ntemps, nwalkers)
-        )
+        state.log_like = -1 / 2 * self.gb_wave_generator.d_d.real.reshape(ntemps, nwalkers)
 
         temp_inds = mgh.temp_indices.copy()
         walker_inds = mgh.walker_indices.copy()
@@ -372,11 +452,28 @@ class GetLastGBState:
 
 
 class HeterodynedUpdate:
+    """Periodic update that re-centers the heterodyne reference for MBH likelihoods.
+
+    Designed to be passed to ``eryn`` as an ``update_fn``. On each call it
+    finds the highest-likelihood walker in the current state, calls
+    ``init_heterodyne_info`` on the underlying MBH template model with that
+    point as the new reference, optionally zeros the model's ``d_d`` term,
+    and recomputes log-prior, log-likelihood, and blobs for the existing
+    samples so they are consistent with the new heterodyne expansion.
+
+    Args:
+        update_kwargs: Keyword arguments forwarded to
+            ``template_model.init_heterodyne_info``.
+        set_d_d_zero: If ``True``, set ``template_model.reference_d_d = 0``
+            after the update.
+    """
+
     def __init__(self, update_kwargs, set_d_d_zero=False):
         self.update_kwargs = update_kwargs
         self.set_d_d_zero = set_d_d_zero
 
     def __call__(self, it, sample_state, sampler, **kwargs):
+        """Re-center the heterodyne and refresh likelihoods on the current state."""
 
         samples = sample_state.branches_coords["mbh"].reshape(-1, sampler.ndims[0])
         lp_max = sample_state.log_like.argmax()
@@ -391,9 +488,7 @@ class HeterodynedUpdate:
             best, copy=True
         )
 
-        sampler.log_like_fn.f.template_model.init_heterodyne_info(
-            best_full, **self.update_kwargs
-        )
+        sampler.log_like_fn.f.template_model.init_heterodyne_info(best_full, **self.update_kwargs)
 
         if self.set_d_d_zero:
             sampler.log_like_fn.f.template_model.reference_d_d = 0.0
@@ -409,3 +504,26 @@ class HeterodynedUpdate:
         sample_state.blobs = blobs
 
         # sampler.backend.save_step(sample_state, np.full_like(lp, True))
+
+
+def get_psd_transform_container(
+    Soms_fill: float = None,
+    Sa_fill: float = None,
+    n_knots: int = 5,
+    freq_min: float = None,
+    freq_max: float = None,
+) -> TransformContainer:
+    """Prepare a :class:`eryn.utils.transform.TransformContainer` for PSD sampling.
+
+    Args:
+        Soms_fill: Optical metrology noise level used to fill PSD knots.
+        Sa_fill: Test-mass acceleration noise level used to fill PSD knots.
+        n_knots: Number of spline knots used to parameterize the PSD.
+        freq_min: Minimum frequency (Hz) of the PSD spline.
+        freq_max: Maximum frequency (Hz) of the PSD spline.
+
+    Returns:
+        Configured ``TransformContainer`` for PSD parameter sampling.
+    """
+    # TODO/DOCS: function body is currently empty; this docstring describes
+    # the intended interface but no transforms are actually constructed yet.

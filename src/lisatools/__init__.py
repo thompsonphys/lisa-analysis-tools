@@ -2,13 +2,12 @@
 
 # ruff: noqa: E402
 try:
-    from lisatools._version import (  # pylint: disable=E0401,E0611
-        __version__,
-        __version_tuple__,
-    )
+    from ._version import __version__  # pylint: disable=E0401,E0611
+    from ._version import __version_tuple__
 
 except ModuleNotFoundError:
-    from importlib.metadata import PackageNotFoundError, version  # pragma: no cover
+    from importlib.metadata import PackageNotFoundError  # pragma: no cover
+    from importlib.metadata import version
 
     try:
         __version__ = version(__name__)
@@ -28,12 +27,53 @@ try:
 except (ModuleNotFoundError, ImportError):
     _is_editable = False
 
+
+def get_include() -> str:
+    """Absolute path to LISAanalysistools' public C++/CUDA header directory.
+
+    Downstream sprint packages (GBGPU, BBHx, FastEMRIWaveforms) add this
+    to their compiler include path so that
+
+        #include "Detector.hpp"           // class Orbits -- LAT-owned
+        #include "orbits_view.hpp"        // OrbitsView POD (preferred)
+        #include "PSD.hpp"
+        #include "lisatools_header_abi.hpp"   // ABI version + wrapper-owner toggle
+
+    resolve against the installed wheel.
+
+    Pair with ``gpubackendtools.get_include()`` -- a downstream typically
+    needs both: GBT for gbt_global.h + cuda_complex.hpp + InterpolateDevice.hh,
+    LAT for the LISA-specific public headers.
+    """
+    import os.path
+    return os.path.join(os.path.dirname(__file__), "cutils")
+
+
+def get_cmake_module_path() -> str:
+    """Absolute path to the directory containing ``LISAanalysisToolsConfig.cmake``.
+
+    For downstreams that prefer ``find_package(LISAanalysisTools CONFIG)``
+    over the Python shell-out form of :func:`get_include`.
+
+    Example::
+
+        execute_process(
+          COMMAND ${Python_EXECUTABLE} -c
+          "import lisatools; print(lisatools.get_cmake_module_path())"
+          OUTPUT_VARIABLE LAT_CMAKE_DIR OUTPUT_STRIP_TRAILING_WHITESPACE)
+        find_package(LISAanalysisTools CONFIG REQUIRED PATHS ${LAT_CMAKE_DIR})
+        target_link_libraries(my_kernel PRIVATE LISAanalysisTools::headers)
+
+    Returns the same directory as :func:`get_include`.
+    """
+    import os.path
+    return os.path.join(os.path.dirname(__file__), "cutils")
+
+
+from gpubackendtools import Globals, get_backend, get_first_backend, has_backend
+
 from . import cutils, utils
-
-from gpubackendtools import get_backend, has_backend, get_first_backend
-from gpubackendtools import Globals
 from .cutils import LISAToolsCpuBackend, LISAToolsCuda11xBackend, LISAToolsCuda12xBackend, LISAToolsCuda13xBackend
-
 
 add_backends = {
     "lisatools_cpu": LISAToolsCpuBackend,
@@ -42,14 +82,19 @@ add_backends = {
     "lisatools_cuda13x": LISAToolsCuda13xBackend,
 }
 
-Globals().backends_manager.add_backends(add_backends)
+# Pure-JAX backend (subpackage gated on `import jax`). Optional.
+try:
+    from .jax import LISAToolsJaxBackend as _LISAToolsJaxBackend
+    if _LISAToolsJaxBackend is not None:
+        add_backends["lisatools_jax"] = _LISAToolsJaxBackend
+except (ImportError, ModuleNotFoundError):
+    pass
 
 Globals().backends_manager.add_backends(add_backends)
-
 
 from gpubackendtools import get_backend as _get_backend
-from gpubackendtools import has_backend as _has_backend
 from gpubackendtools import get_first_backend as _get_first_backend
+from gpubackendtools import has_backend as _has_backend
 from gpubackendtools.gpubackendtools import Backend
 
 
@@ -68,7 +113,7 @@ def has_backend(backend: str) -> Backend:
     else:
         return _has_backend(backend)
 
-        
+
 def get_first_backend(backend: str) -> Backend:
     __doc__ = _get_first_backend.__doc__
     if "lisatools_" not in backend:
@@ -76,10 +121,17 @@ def get_first_backend(backend: str) -> Backend:
     else:
         return _get_first_backend(backend)
 
+
+from .analysiscontainer import AnalysisContainer
+from .datacontainer import DataResidualArray
+from .sensitivity import SensitivityMatrix, get_sensitivity
+
 __all__ = [
     "__version__",
     "__version_tuple__",
     "_is_editable",
+    "get_include",
+    "get_cmake_module_path",
     "get_logger",
     "get_config",
     "get_config_setter",
